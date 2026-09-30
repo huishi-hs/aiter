@@ -220,7 +220,9 @@ python mha_gen_runtime_json.py \
 The merger:
 
 1. Groups tuned rows per `(dtype, compiled_hdim_q, compiled_hdim_v)`.
-2. Sorts by `max_seqlen`, computes integer-midpoint boundaries, folds
+2. Sorts by `max_seqlen`, computes integer-midpoint boundaries
+   (`(M_i + M_{i+1} + 1) // 2`, rounded up so each sample stays inside
+   its own half-open interval `[low, high)`), folds
    consecutive rows that pick the same tile into one interval, and OR-s
    non-contiguous runs of the same tile.
 3. Emits every tile with a `cpp_constraint` string (e.g.

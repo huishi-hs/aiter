@@ -21,8 +21,11 @@ Design (approved 2026-08-25, see history):
    because CK codegen keys tiles on compiled hdim.
 
 3. Buckets: for each source CSV, sort rows by max_seqlen ascending; the
-   boundary between two neighboring rows i / i+1 is `(M_i + M_{i+1}) // 2`
-   (integer midpoint). The i-th row therefore owns the half-open interval
+   boundary between two neighboring rows i / i+1 is
+   `(M_i + M_{i+1} + 1) // 2` (integer midpoint rounded up, so that
+   M_i < mid_i <= M_{i+1} and every sample M_i lies inside its own
+   interval, even for adjacent samples such as 512 / 513). The i-th row
+   therefore owns the half-open interval
    `[low_i, high_i)`:
      * low_0    = -inf (represented as absence of the lower bound)
      * low_i    = mid_{i-1}         for i >= 1
@@ -259,11 +262,12 @@ def _row_intervals(
     for i in range(n - 1):
         a = rows[i]["max_seqlen"]
         b = rows[i + 1]["max_seqlen"]
-        # (a + b) // 2 is well-defined and strictly greater than a whenever
-        # b > a + 1; for adjacent (b == a + 1) it equals a, giving an empty
-        # interval on the smaller side, which is harmless because ranges
-        # are half-open and the boundary flips to the next row anyway.
-        mids.append((a + b) // 2)
+        # Round the midpoint UP so that a < mid <= b for every a < b.
+        # With half-open intervals [low, high) this guarantees that each
+        # sample `a` falls inside its own row's interval (never empty),
+        # including adjacent samples (b == a + 1 -> mid == b). A tie (an
+        # exact-middle length for odd gaps) goes to the larger sample.
+        mids.append((a + b + 1) // 2)
 
     intervals: List[Tuple[Optional[int], Optional[int]]] = []
     for i in range(n):
