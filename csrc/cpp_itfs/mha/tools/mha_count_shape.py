@@ -52,7 +52,6 @@ import sys
 from collections import Counter, OrderedDict
 from pathlib import Path
 
-
 # --------------------------------------------------------------------------- #
 # Log format (strictly aligned with the output emitted by mha_fwd_dump.h):
 #   [MHA_FWD] mode=group dtype=bf16 hdim_q=72 hdim_v=72 nhead_q=16 nhead_k=16

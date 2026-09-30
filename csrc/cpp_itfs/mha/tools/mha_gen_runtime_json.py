@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 """
@@ -59,12 +58,12 @@ import json
 import re
 import sys
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any
 
 # CK's FmhaFwdTileSize field order (19 fields), must stay in sync with
 # 3rdparty/composable_kernel/example/ck_tile/01_fmha/codegen/ops/fmha_fwd.py
 # (see FmhaFwdTileSize dataclass) and mha_tune.py's TileSize._ORDERED_FIELDS.
-_ORDERED_FIELDS: Tuple[str, ...] = (
+_ORDERED_FIELDS: tuple[str, ...] = (
     "F_bm0",
     "F_bn0",
     "F_bk0",
@@ -108,7 +107,7 @@ _TUNED_NAME_RE = re.compile(
 # ===========================================================================
 
 
-def _parse_tile_expr(expr: str) -> Dict[str, int]:
+def _parse_tile_expr(expr: str) -> dict[str, int]:
     """Extract 19 ints from `best_tile_expr` and return a dict keyed by
     _ORDERED_FIELDS."""
     m = _TILE_EXPR_RE.search(expr)
@@ -118,7 +117,7 @@ def _parse_tile_expr(expr: str) -> Dict[str, int]:
     return dict(zip(_ORDERED_FIELDS, values))
 
 
-def _tile_signature(tile: Dict[str, int]) -> Tuple[int, ...]:
+def _tile_signature(tile: dict[str, int]) -> tuple[int, ...]:
     """Immutable key used to compare tiles (all 19 fields in order)."""
     return tuple(tile[k] for k in _ORDERED_FIELDS)
 
@@ -136,10 +135,10 @@ class TunedCsv:
         self.compiled_hdim_v: int = 0
         self.mask_type: int = 0
         # Each entry: {"max_seqlen": int, "tile": {F_*: int, ...}}
-        self.rows: List[Dict[str, Any]] = []
+        self.rows: list[dict[str, Any]] = []
 
     @staticmethod
-    def load(path: Path) -> "TunedCsv":
+    def load(path: Path) -> TunedCsv:
         obj = TunedCsv(path)
 
         # sanity-check the filename shape (non-fatal if it differs, just warn).
@@ -172,7 +171,7 @@ class TunedCsv:
                     f"{obj.path}: missing required columns: {sorted(missing)}"
                 )
 
-            group_key_seen: Optional[Tuple[str, str, int, int, int, int, int]] = None
+            group_key_seen: tuple[str, str, int, int, int, int, int] | None = None
             for row in reader:
                 if row.get("status", "").strip() != "ok":
                     continue
@@ -219,8 +218,8 @@ class TunedCsv:
         # Sort ascending by max_seqlen; also deduplicate exact-duplicate
         # max_seqlen entries (keeping the first, warn on rest).
         obj.rows.sort(key=lambda r: r["max_seqlen"])
-        deduped: List[Dict[str, Any]] = []
-        seen: Dict[int, Dict[str, Any]] = {}
+        deduped: list[dict[str, Any]] = []
+        seen: dict[int, dict[str, Any]] = {}
         for r in obj.rows:
             M = r["max_seqlen"]
             if M in seen:
@@ -243,8 +242,8 @@ class TunedCsv:
 
 
 def _row_intervals(
-    rows: List[Dict[str, Any]],
-) -> List[Tuple[Optional[int], Optional[int]]]:
+    rows: list[dict[str, Any]],
+) -> list[tuple[int | None, int | None]]:
     """Given rows sorted by max_seqlen, return per-row half-open interval
     [low, high) where boundaries are integer midpoints between neighbors.
 
@@ -258,7 +257,7 @@ def _row_intervals(
         # single row covers the entire real line
         return [(None, None)]
 
-    mids: List[int] = []
+    mids: list[int] = []
     for i in range(n - 1):
         a = rows[i]["max_seqlen"]
         b = rows[i + 1]["max_seqlen"]
@@ -269,7 +268,7 @@ def _row_intervals(
         # exact-middle length for odd gaps) goes to the larger sample.
         mids.append((a + b + 1) // 2)
 
-    intervals: List[Tuple[Optional[int], Optional[int]]] = []
+    intervals: list[tuple[int | None, int | None]] = []
     for i in range(n):
         low = None if i == 0 else mids[i - 1]
         high = None if i == n - 1 else mids[i]
@@ -278,9 +277,9 @@ def _row_intervals(
 
 
 def _fold_same_tile(
-    rows: List[Dict[str, Any]],
-    intervals: List[Tuple[Optional[int], Optional[int]]],
-) -> List[Dict[str, Any]]:
+    rows: list[dict[str, Any]],
+    intervals: list[tuple[int | None, int | None]],
+) -> list[dict[str, Any]]:
     """Group entries by tile signature, folding contiguous same-tile runs
     into one interval, but preserving non-contiguous runs as separate
     intervals under the same tile.
@@ -294,7 +293,7 @@ def _fold_same_tile(
     Preserves the encounter order of tiles.
     """
     # Step 1: fold contiguous same-tile runs.
-    folded_runs: List[Dict[str, Any]] = []
+    folded_runs: list[dict[str, Any]] = []
     for row, (low, high) in zip(rows, intervals):
         sig = _tile_signature(row["tile"])
         if folded_runs and folded_runs[-1]["_sig"] == sig:
@@ -313,8 +312,8 @@ def _fold_same_tile(
             )
 
     # Step 2: group by tile signature, keeping first-seen order.
-    order: List[Tuple[int, ...]] = []
-    grouped: Dict[Tuple[int, ...], Dict[str, Any]] = {}
+    order: list[tuple[int, ...]] = []
+    grouped: dict[tuple[int, ...], dict[str, Any]] = {}
     for run in folded_runs:
         sig = run["_sig"]
         if sig not in grouped:
@@ -332,7 +331,7 @@ def _fold_same_tile(
 
 
 def _interval_to_cpp(
-    low: Optional[int], high: Optional[int], var: str = "a.max_seqlen_q"
+    low: int | None, high: int | None, var: str = "a.max_seqlen_q"
 ) -> str:
     """Render one half-open interval [low, high) as a C++ boolean expr."""
     if low is None and high is None:
@@ -345,7 +344,7 @@ def _interval_to_cpp(
 
 
 def _intervals_to_cpp(
-    intervals: List[Tuple[Optional[int], Optional[int]]], var: str = "a.max_seqlen_q"
+    intervals: list[tuple[int | None, int | None]], var: str = "a.max_seqlen_q"
 ) -> str:
     """OR multiple intervals into one C++ boolean expression."""
     parts = [_interval_to_cpp(lo, hi, var) for (lo, hi) in intervals]
@@ -362,37 +361,37 @@ def _intervals_to_cpp(
 
 
 def build_merged_payload(
-    csv_paths: List[Path],
+    csv_paths: list[Path],
     target: str,
     schema_version: int,
     constraint_var: str,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """Read every csv, group by (dtype, best_hq, best_hv), and produce the
     final JSON payload (as a Python dict).
     """
-    loaded: List[TunedCsv] = [TunedCsv.load(p) for p in csv_paths]
+    loaded: list[TunedCsv] = [TunedCsv.load(p) for p in csv_paths]
 
     # Group by (dtype, compiled_hq, compiled_hv). Each group can contain
     # multiple csv sources (e.g. same shape tuned twice with different mask
     # types); item 4 of the spec says we ignore mask/bias/lse/dropout so
     # we merge them into one tile pool.
-    grouped_rows: Dict[Tuple[str, int, int], List[Dict[str, Any]]] = {}
-    grouped_sources: Dict[Tuple[str, int, int], List[TunedCsv]] = {}
+    grouped_rows: dict[tuple[str, int, int], list[dict[str, Any]]] = {}
+    grouped_sources: dict[tuple[str, int, int], list[TunedCsv]] = {}
     for lc in loaded:
         key = (lc.dtype, lc.compiled_hdim_q, lc.compiled_hdim_v)
         grouped_rows.setdefault(key, []).extend(lc.rows)
         grouped_sources.setdefault(key, []).append(lc)
 
-    tiles_by_dtype: Dict[str, Dict[str, List[Dict[str, Any]]]] = {}
-    dtypes_seen: List[str] = []
+    tiles_by_dtype: dict[str, dict[str, list[dict[str, Any]]]] = {}
+    dtypes_seen: list[str] = []
 
     for (dtype, hq, hv), rows in grouped_rows.items():
         # Re-sort merged rows by max_seqlen and dedupe on max_seqlen (same
         # rules as inside TunedCsv.load, only that here duplicates may come
         # from different csv sources).
         rows.sort(key=lambda r: r["max_seqlen"])
-        dedup: List[Dict[str, Any]] = []
-        seen: Dict[int, Dict[str, Any]] = {}
+        dedup: list[dict[str, Any]] = []
+        seen: dict[int, dict[str, Any]] = {}
         for r in rows:
             M = r["max_seqlen"]
             if M in seen:
@@ -411,9 +410,9 @@ def build_merged_payload(
         folded = _fold_same_tile(dedup, intervals)
 
         # Assemble tile objects for this (dtype, hq, hv) bucket.
-        tile_objs: List[Dict[str, Any]] = []
+        tile_objs: list[dict[str, Any]] = []
         for entry in folded:
-            tile: Dict[str, Any] = dict(entry["tile"])  # copy F_* ints
+            tile: dict[str, Any] = dict(entry["tile"])  # copy F_* ints
             tile["cpp_constraint"] = _intervals_to_cpp(
                 entry["intervals"], var=constraint_var
             )
@@ -427,7 +426,7 @@ def build_merged_payload(
         if dtype not in dtypes_seen:
             dtypes_seen.append(dtype)
 
-    payload: Dict[str, Any] = {
+    payload: dict[str, Any] = {
         "schema_version": schema_version,
         "target": target,
         "dtypes": dtypes_seen,
@@ -536,7 +535,7 @@ def _build_parser() -> argparse.ArgumentParser:
     return p
 
 
-def _strip_for_runtime(payload: Dict[str, Any]) -> Dict[str, Any]:
+def _strip_for_runtime(payload: dict[str, Any]) -> dict[str, Any]:
     """Return a deep-ish copy of `payload` containing ONLY the fields that
     CK actually consumes when loading a custom tune-config JSON.
 
@@ -558,16 +557,16 @@ def _strip_for_runtime(payload: Dict[str, Any]) -> Dict[str, Any]:
           proactively strip to shrink the deployment JSON)
     """
     kept_tile_keys = set(_ORDERED_FIELDS) | {"cpp_constraint"}
-    stripped_tiles: Dict[str, Dict[str, List[Dict[str, Any]]]] = {}
+    stripped_tiles: dict[str, dict[str, list[dict[str, Any]]]] = {}
     for dtype, hmap in payload.get("tiles", {}).items():
-        stripped_hmap: Dict[str, List[Dict[str, Any]]] = {}
+        stripped_hmap: dict[str, list[dict[str, Any]]] = {}
         for hkey, tile_list in hmap.items():
             stripped_hmap[hkey] = [
                 {k: v for k, v in t.items() if k in kept_tile_keys} for t in tile_list
             ]
         stripped_tiles[dtype] = stripped_hmap
 
-    out: Dict[str, Any] = {}
+    out: dict[str, Any] = {}
     # Preserve schema_version if present, for forward-compat.
     if "schema_version" in payload:
         out["schema_version"] = payload["schema_version"]
@@ -578,7 +577,7 @@ def _strip_for_runtime(payload: Dict[str, Any]) -> Dict[str, Any]:
     return out
 
 
-def _print_summary(payload: Dict[str, Any]) -> None:
+def _print_summary(payload: dict[str, Any]) -> None:
     print()
     print("# ==== merge summary ====")
     for dtype, hkey_map in payload["tiles"].items():

@@ -206,7 +206,7 @@ python3 -m pytest op_tests/test_mha_varlen_fwd_dump.py -v   # 需要 GPU
 
 ## 八、TODO
 
-- [ ] Commit 1：测试基础设施 + 中点修复
+- [x] Commit 1：测试基础设施 + 中点修复
 - [ ] Commit 2：合并冲突检测
 - [ ] Commit 3：build stamp
 - [ ] Commit 4：dump 增强

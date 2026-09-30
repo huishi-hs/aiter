@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 """
@@ -112,11 +111,11 @@ import shlex
 import shutil
 import subprocess
 import sys
+from collections.abc import Sequence
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass, asdict
+from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple
-
+from typing import Any
 
 # ===========================================================================
 # 0. Constants
@@ -142,7 +141,7 @@ ARCH = "gfx942"
 # `window_generic` (mask_type == 3) cannot be represented without the (y, x)
 # window; leave it unmapped so the caller aborts with a clear error instead
 # of silently benching a wrong shape.
-MASK_TYPE_TO_LETTER: Dict[int, Optional[str]] = {
+MASK_TYPE_TO_LETTER: dict[int, str | None] = {
     0: "0",  # no_mask
     1: "1",  # mask_top_left      (top-left causal)
     2: "2",  # mask_bottom_right  (bottom-right causal)
@@ -160,13 +159,13 @@ MASK_TYPE_TO_LETTER: Dict[int, Optional[str]] = {
 # Keep in sync with
 # 3rdparty/composable_kernel/example/ck_tile/01_fmha/codegen/cpp_symbol_map.py
 # (get_mask_map).
-MASK_TYPE_TO_CK_NAME_SIMPLIFIED: Dict[int, str] = {
+MASK_TYPE_TO_CK_NAME_SIMPLIFIED: dict[int, str] = {
     0: "s_no",  # no_mask
     1: "s_mask",  # mask_top_left
     2: "s_mask",  # mask_bottom_right
     3: "s_mask",  # window_generic
 }
-MASK_TYPE_TO_CK_NAME_GENERIC: Dict[int, str] = {
+MASK_TYPE_TO_CK_NAME_GENERIC: dict[int, str] = {
     0: "no",
     1: "causal",  # mask_top_left     -> causal
     2: "causal",  # mask_bottom_right -> causal
@@ -179,7 +178,7 @@ DEFAULT_MASK_IMPL = "simplified"
 
 def _mask_type_to_ck_name(
     mask_type: int, mask_impl: str = DEFAULT_MASK_IMPL
-) -> Optional[str]:
+) -> str | None:
     if mask_impl == "simplified":
         return MASK_TYPE_TO_CK_NAME_SIMPLIFIED.get(int(mask_type))
     if mask_impl == "generic":
@@ -190,7 +189,7 @@ def _mask_type_to_ck_name(
 # Mapping from tile_example_fmha_fwd's -bias= letter to CK codegen's BIAS_MAP
 # key. Keep in sync with
 # 3rdparty/composable_kernel/example/ck_tile/01_fmha/codegen/cpp_symbol_map.py.
-BIAS_LETTER_TO_CK_NAME: Dict[str, str] = {
+BIAS_LETTER_TO_CK_NAME: dict[str, str] = {
     "n": "no",
     "e": "bias",  # elementwise
     "a": "alibi",
@@ -201,7 +200,7 @@ DEFAULT_BUILD_TARGET = "tile_example_fmha_fwd"
 
 # Default CMake configure options (mirrors gen_tune_configs.py).
 # NOTE: `-DFMHA_FWD_GEN_OPTDIM=<hdim_q>` is appended per-pair at runtime.
-DEFAULT_CMAKE_OPTIONS: List[str] = [
+DEFAULT_CMAKE_OPTIONS: list[str] = [
     "-G",
     "Ninja",
     "-DCMAKE_BUILD_TYPE=Release",
@@ -256,8 +255,8 @@ BK0_CANDIDATES = [16, 32, 64]
 BK1_CANDIDATES = [16, 32, 64]
 
 # bf16 mfma on gfx942 (CDNA3): (wm, wn, wk)
-MFMA_BF16_DEFAULT: List[Tuple[int, int, int]] = [(32, 32, 16)]
-MFMA_BF16_EXTRA: List[Tuple[int, int, int]] = [(16, 16, 16), (16, 16, 32)]
+MFMA_BF16_DEFAULT: list[tuple[int, int, int]] = [(32, 32, 16)]
+MFMA_BF16_EXTRA: list[tuple[int, int, int]] = [(16, 16, 16), (16, 16, 32)]
 
 WARP_TOTAL_CANDIDATES = [4]
 WARP_LAYOUTS = {
@@ -277,7 +276,7 @@ def _next_pow2(x: int) -> int:
     return 1 << (x - 1).bit_length()
 
 
-def _bk0max_candidates(hdim: int) -> List[int]:
+def _bk0max_candidates(hdim: int) -> list[int]:
     """Allowed F_bk0max values, deduced from CK's official tile table.
 
     * Most (hdim, hdim_v) rows: bk0max == hdim.
@@ -350,10 +349,10 @@ class TileSize:
             base += f"_o{self.F_occupancy}"
         return base
 
-    def as_args(self) -> List[int]:
+    def as_args(self) -> list[int]:
         return [getattr(self, k) for k in self._ORDERED_FIELDS]
 
-    def fields_dict(self) -> Dict[str, int]:
+    def fields_dict(self) -> dict[str, int]:
         return {k: int(getattr(self, k)) for k in self._ORDERED_FIELDS}
 
     def as_ck_expr(self) -> str:
@@ -381,9 +380,7 @@ def _layer0_semantic(t: TileSize, hdim: int, hdim_v: int) -> bool:
         return False
     if t.F_bk0max not in _bk0max_candidates(hdim):
         return False
-    if t.F_rk0 != 1 or t.F_rk1 != 1:
-        return False
-    return True
+    return t.F_rk0 == 1 and t.F_rk1 == 1
 
 
 def _layer1_self_consistent(t: TileSize) -> bool:
@@ -405,9 +402,7 @@ def _layer1_self_consistent(t: TileSize) -> bool:
         return False
     if (t.F_rn1 * t.F_wn1) == 0 or t.F_bn1 % (t.F_rn1 * t.F_wn1) != 0:
         return False
-    if t.F_wk1 == 0 or t.F_bk1 % t.F_wk1 != 0:
-        return False
-    return True
+    return t.F_wk1 != 0 and t.F_bk1 % t.F_wk1 == 0
 
 
 def _layer2_gfx9_check_hdim_tile(t: TileSize, hdim: int, hdim_v: int) -> bool:
@@ -436,8 +431,8 @@ def enumerate_tiles(
     hdim: int,
     hdim_v: int,
     occupancies: Sequence[int],
-    mfma_list: Sequence[Tuple[int, int, int]],
-) -> Tuple[List[TileSize], Dict[str, int]]:
+    mfma_list: Sequence[tuple[int, int, int]],
+) -> tuple[list[TileSize], dict[str, int]]:
     """Enumerate legal FmhaFwdTileSize candidates for one (hdim, hdim_v)."""
     stats = {
         "total_enumerated": 0,
@@ -448,7 +443,7 @@ def enumerate_tiles(
     }
 
     seen: set = set()
-    tiles: List[TileSize] = []
+    tiles: list[TileSize] = []
 
     bk0max_choices = _bk0max_candidates(hdim)
 
@@ -577,7 +572,7 @@ class UntuneMeta:
     the CK-tile fmha kernel table (dtype/hdim/mask/mode).
     """
 
-    gid: Optional[int]  # group id from filename ('0' etc.), maybe None
+    gid: int | None  # group id from filename ('0' etc.), maybe None
     mode: str  # 'group' or 'batch'
     dtype: str  # 'bf16' / 'fp16'
     hdim_q: int  # from CSV / filename
@@ -587,7 +582,7 @@ class UntuneMeta:
     input_path: Path
 
 
-def parse_untune_csv(path: Path) -> Tuple[UntuneMeta, List[int]]:
+def parse_untune_csv(path: Path) -> tuple[UntuneMeta, list[int]]:
     """Read mha_untune_*.csv and return (meta, max_seqlen_list).
 
     The CSV must have header:
@@ -634,7 +629,7 @@ def parse_untune_csv(path: Path) -> Tuple[UntuneMeta, List[int]]:
             )
 
     # Filename-based gid (best-effort).
-    gid: Optional[int] = None
+    gid: int | None = None
     m = _UNTUNE_NAME_RE.match(path.name)
     if m:
         try:
@@ -679,9 +674,9 @@ def _build_tune_config_payload(
     tile: TileSize,
     *,
     target: str = ARCH,
-    filters: Optional[Dict[str, List[str]]] = None,
+    filters: dict[str, list[str]] | None = None,
     disable_check_hdim_tile: bool = True,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """Build the CustomTuneFactory JSON payload (v1 schema).
 
     Layout expected by
@@ -699,7 +694,7 @@ def _build_tune_config_payload(
     Only a single tile is embedded (one JSON per tile → one build dir).
     """
     hkey = f"{int(hdim)},{int(hdim_v)}"
-    payload: Dict[str, Any] = {
+    payload: dict[str, Any] = {
         "schema_version": 1,
         "target": str(target),
         "dtypes": [dtype],
@@ -717,7 +712,7 @@ def _build_tune_config_payload(
     return payload
 
 
-def _write_tune_config_file(path: Path, payload: Dict[str, Any]) -> str:
+def _write_tune_config_file(path: Path, payload: dict[str, Any]) -> str:
     """Write payload to disk, return its serialized (pretty) form."""
     path.parent.mkdir(parents=True, exist_ok=True)
     text = json.dumps(payload, indent=2, sort_keys=False)
@@ -734,8 +729,8 @@ def _tune_config_path(pair_sub_dir: Path, tile: TileSize) -> Path:
 
 
 def _filters_from_args(
-    args: argparse.Namespace, meta: "UntuneMeta"
-) -> Dict[str, List[str]]:
+    args: argparse.Namespace, meta: UntuneMeta
+) -> dict[str, list[str]]:
     """Assemble the CustomTuneFactory `filters` block from CLI + CSV meta.
 
     Only added when we know enough runtime info (i.e. build / run cmd). enum
@@ -749,7 +744,7 @@ def _filters_from_args(
     lse = getattr(args, "lse", None)
     p_drop = getattr(args, "p_drop", None)
 
-    filters: Dict[str, List[str]] = {
+    filters: dict[str, list[str]] = {
         "mode": [str(meta.mode)],
         "vlayout": ["row"],
     }
@@ -768,24 +763,24 @@ def _filters_from_args(
     return filters
 
 
-def _which_hipcc() -> Optional[str]:
+def _which_hipcc() -> str | None:
     from shutil import which
 
     return which("hipcc")
 
 
-def _format_cmd(cmd: List[str], env_overrides: Dict[str, str]) -> str:
+def _format_cmd(cmd: list[str], env_overrides: dict[str, str]) -> str:
     env_part = " ".join(f"{k}={shlex.quote(v)}" for k, v in env_overrides.items())
     cmd_part = " ".join(shlex.quote(x) for x in cmd)
     return (env_part + " " + cmd_part) if env_part else cmd_part
 
 
 def _run_cmd(
-    cmd: List[str],
-    env_overrides: Dict[str, str],
+    cmd: list[str],
+    env_overrides: dict[str, str],
     cwd: str,
     dry_run: bool,
-    log: Optional[List[str]] = None,
+    log: list[str] | None = None,
 ) -> int:
     """Run a subprocess. If `log` is provided we capture combined output into
     it (concurrent-friendly); else we stream directly to stdout.
@@ -830,11 +825,11 @@ def _run_cmd(
 
 
 def _run_cmd_capture(
-    cmd: List[str],
-    env_overrides: Dict[str, str],
+    cmd: list[str],
+    env_overrides: dict[str, str],
     cwd: str,
     dry_run: bool,
-) -> Tuple[int, str]:
+) -> tuple[int, str]:
     """Run a subprocess, capture combined stdout+stderr, mirror to console."""
     print(f"  [cmd] cwd={cwd}")
     print(f"        {_format_cmd(cmd, env_overrides)}")
@@ -864,12 +859,12 @@ def _run_cmd_capture(
 def _do_configure(
     build_dir: str,
     cfg_json_path: str,
-    hipcc: Optional[str],
-    extra_cmake_opts: List[str],
+    hipcc: str | None,
+    extra_cmake_opts: list[str],
     ck_root: str,
     dry_run: bool,
     fresh: bool,
-    log: Optional[List[str]],
+    log: list[str] | None,
 ) -> int:
     """`cmake -S <ck_root> -B <build_dir> ...` with tune config injected.
 
@@ -893,7 +888,7 @@ def _do_configure(
     else:
         _emit(f"  [fresh] SKIPPED (per --no-fresh): {build_dir}")
 
-    cmd: List[str] = ["cmake", "-S", ".", "-B", build_dir]
+    cmd: list[str] = ["cmake", "-S", ".", "-B", build_dir]
     if hipcc:
         cmd += [
             f"-DCMAKE_CXX_COMPILER={hipcc}",
@@ -918,7 +913,7 @@ def _verify_blob_list(
     build_dir: str,
     expected_tile_token: str,
     dry_run: bool,
-) -> Tuple[bool, str]:
+) -> tuple[bool, str]:
     """After configure, sanity-check that fwd_blob_list.txt contains
     the expected tile token (i.e. CustomTuneFactory did take effect).
     """
@@ -952,14 +947,14 @@ def _do_make(
     cfg_json_path: str,
     ck_root: str,
     dry_run: bool,
-    log: Optional[List[str]],
+    log: list[str] | None,
 ) -> int:
     """`cmake --build <build_dir> --target <target> -j <jobs>`
 
     NOTE: CK-tile fmha runs codegen (Python) at BUILD time via
     add_custom_command, so tune-config env vars must be present here too.
     """
-    cmd: List[str] = [
+    cmd: list[str] = [
         "cmake",
         "--build",
         build_dir,
@@ -984,9 +979,9 @@ def _binary_path(build_dir: str, target: str) -> str:
 # ===========================================================================
 
 
-def _parse_perf(stdout: str) -> Optional[Dict[str, Any]]:
+def _parse_perf(stdout: str) -> dict[str, Any] | None:
     """Return the LAST perf triplet parsed from stdout, or None."""
-    last: Optional[Dict[str, Any]] = None
+    last: dict[str, Any] | None = None
     for raw in stdout.splitlines():
         m = _PERF_RE.search(raw)
         if not m:
@@ -1016,7 +1011,7 @@ def _build_bench_args(
     warmup: int,
     repeat: int,
     mode: str,
-) -> List[str]:
+) -> list[str]:
     """Assemble CLI for tile_example_fmha_fwd (b=1, mode matches build).
 
     The kernel instances emitted by CustomTuneFactory are strictly filtered on
@@ -1067,10 +1062,10 @@ def _build_bench_args(
 
 def _do_bench(
     binary: str,
-    bench_args: List[str],
+    bench_args: list[str],
     ck_root: str,
     dry_run: bool,
-) -> Tuple[str, Optional[Dict[str, Any]]]:
+) -> tuple[str, dict[str, Any] | None]:
     """Run one built binary once; return (status, parsed_perf).
 
     status in {"ok", "skipped", "run_failed", "no_perf"}.
@@ -1135,7 +1130,7 @@ def _pair_plans(
     work_dir: Path,
     tune_hdim_q: int,
     tune_hdim_v: int,
-) -> List[PairPlan]:
+) -> list[PairPlan]:
     """Materialize per-pair sub-directories.
 
     Currently we only support a single (hdim_q, hdim_v) per invocation
@@ -1159,8 +1154,8 @@ def _write_tiles_json(
     dtype: str,
     hdim_q: int,
     hdim_v: int,
-    tiles: List[TileSize],
-    stats: Dict[str, int],
+    tiles: list[TileSize],
+    stats: dict[str, int],
 ) -> None:
     payload = {
         "arch": ARCH,
@@ -1183,12 +1178,12 @@ def _write_tiles_json(
     path.write_text(json.dumps(payload, indent=2))
 
 
-def _read_tiles_json(path: Path) -> Tuple[str, int, int, List[TileSize]]:
+def _read_tiles_json(path: Path) -> tuple[str, int, int, list[TileSize]]:
     data = json.loads(path.read_text())
     dtype = data["dtype"]
     hdim_q = int(data["hdim"])
     hdim_v = int(data["hdim_v"])
-    tiles: List[TileSize] = []
+    tiles: list[TileSize] = []
     for entry in data.get("strict_legal", []):
         fields = entry["fields"]
         tiles.append(TileSize(**{k: int(fields[k]) for k in TileSize._ORDERED_FIELDS}))
@@ -1200,14 +1195,14 @@ def _read_tiles_json(path: Path) -> Tuple[str, int, int, List[TileSize]]:
 # ===========================================================================
 
 
-def _resolve_occupancies(arg: Optional[str]) -> List[int]:
+def _resolve_occupancies(arg: str | None) -> list[int]:
     """Parse `--occupancy` CLI (comma-separated or single value)."""
     if arg is None or arg == "":
         return [1, 2, 3, 4, 5]
     parts = [x.strip() for x in arg.split(",") if x.strip() != ""]
     if not parts:
         return [1, 2, 3, 4, 5]
-    out: List[int] = []
+    out: list[int] = []
     for p in parts:
         v = int(p)
         if v not in (-1, 1, 2, 3, 4, 5):
@@ -1216,7 +1211,7 @@ def _resolve_occupancies(arg: Optional[str]) -> List[int]:
     return out
 
 
-def _mfma_list_for(dtype: str, allow_mfma_16: bool) -> List[Tuple[int, int, int]]:
+def _mfma_list_for(dtype: str, allow_mfma_16: bool) -> list[tuple[int, int, int]]:
     if dtype != "bf16":
         # Currently our enumeration mirrors bf16 rules only.
         print(
@@ -1287,7 +1282,7 @@ def cmd_enum(args: argparse.Namespace) -> int:
         # `enum` doesn't yet know filter-side info (lse/dropout/bias); those
         # are written as an empty `filters` block and will be overwritten by
         # `build` stage. `mask` we DO know from the untune csv.
-        enum_filters: Dict[str, List[str]] = {
+        enum_filters: dict[str, list[str]] = {
             "mode": [str(meta.mode)],
             "vlayout": ["row"],
             "logits": ["f"],
@@ -1326,19 +1321,19 @@ def cmd_enum(args: argparse.Namespace) -> int:
 
 def _tile_plans_for(
     pair: PairPlan,
-    tiles: List[TileSize],
+    tiles: list[TileSize],
     dtype: str,
     *,
-    filters: Optional[Dict[str, List[str]]] = None,
+    filters: dict[str, list[str]] | None = None,
     disable_check_hdim_tile: bool = True,
-) -> List[TilePlan]:
+) -> list[TilePlan]:
     """Materialize TilePlan for each tile, writing its stand-alone tune JSON.
 
     If `filters` is provided (build / run cmds), the on-disk JSON is
     overwritten to contain the full v1 payload; if not (enum cmd), only the
     `tiles` + `relax_rules` blocks are written (build stage will overwrite).
     """
-    plans: List[TilePlan] = []
+    plans: list[TilePlan] = []
     for t in tiles:
         payload = _build_tune_config_payload(
             dtype,
@@ -1366,9 +1361,9 @@ def _tile_plans_for(
 
 def _configure_and_build_one(
     plan: TilePlan,
-    hipcc: Optional[str],
+    hipcc: str | None,
     ck_root: str,
-    extra_cmake_opts: List[str],
+    extra_cmake_opts: list[str],
     do_configure: bool,
     do_make: bool,
     build_target: str,
@@ -1376,8 +1371,8 @@ def _configure_and_build_one(
     fresh: bool,
     dry_run: bool,
     buffered: bool,
-) -> Dict[str, Any]:
-    log: Optional[List[str]] = [] if buffered else None
+) -> dict[str, Any]:
+    log: list[str] | None = [] if buffered else None
 
     def _emit(msg: str) -> None:
         if log is not None:
@@ -1389,7 +1384,7 @@ def _configure_and_build_one(
     _emit(f"  build_dir={plan.build_dir}")
     _emit(f"  CK_TILE_FMHA_FWD_CUSTOM_TUNE_CONFIG_FILE={plan.cfg_json_path}")
 
-    result: Dict[str, Any] = {
+    result: dict[str, Any] = {
         "tile_name": plan.tile.name,
         "pair": (plan.pair.hdim_q, plan.pair.hdim_v),
         "build_dir": str(plan.build_dir),
@@ -1453,11 +1448,11 @@ def _configure_and_build_one(
 
 
 def _build_stage(
-    plans: List[TilePlan],
+    plans: list[TilePlan],
     args: argparse.Namespace,
     do_configure: bool,
     do_make: bool,
-) -> Tuple[int, List[TilePlan]]:
+) -> tuple[int, list[TilePlan]]:
     """Configure and/or build every tile plan.
 
     Returns (exit_code, successfully_built_plans).
@@ -1471,7 +1466,7 @@ def _build_stage(
     # Per-pair -DFMHA_FWD_GEN_OPTDIM=<hdim_q>. We keep other --cmake-opt
     # user overrides as-is; they win over defaults (CMake takes the last
     # -D<var>=<val>).
-    extra_by_pair: Dict[Tuple[int, int], List[str]] = {}
+    extra_by_pair: dict[tuple[int, int], list[str]] = {}
     for p in plans:
         key = (p.pair.hdim_q, p.pair.hdim_v)
         if key not in extra_by_pair:
@@ -1491,11 +1486,11 @@ def _build_stage(
     workers = max(1, int(args.workers))
     concurrent = workers > 1 and (do_configure or do_make)
 
-    ok_plans: List[TilePlan] = []
-    configure_failures: List[str] = []
-    build_failures: List[str] = []
+    ok_plans: list[TilePlan] = []
+    configure_failures: list[str] = []
+    build_failures: list[str] = []
 
-    def _fold(res: Dict[str, Any], src_plan: TilePlan) -> Optional[int]:
+    def _fold(res: dict[str, Any], src_plan: TilePlan) -> int | None:
         buf = res.get("log")
         if buf:
             print("\n".join(buf))
@@ -1532,7 +1527,7 @@ def _build_stage(
                 p = futures[fut]
                 try:
                     res = fut.result()
-                except Exception as e:
+                except Exception as e:  # noqa: BLE001
                     print(
                         f"[fatal] worker raised for {p.tile.name}: {e}", file=sys.stderr
                     )
@@ -1584,9 +1579,9 @@ def _load_pair_plans_from_disk(
     tune_hdim_v: int,
     dtype: str,
     *,
-    filters: Optional[Dict[str, List[str]]] = None,
+    filters: dict[str, list[str]] | None = None,
     limit: int = 0,
-) -> List[TilePlan]:
+) -> list[TilePlan]:
     """Reload tile candidates from `tile_candidates.json` under each pair.
 
     If `filters` is provided, every per-tile tune-config JSON is (re)written
@@ -1595,7 +1590,7 @@ def _load_pair_plans_from_disk(
     N entries per pair (matches `cmd_enum`'s --limit behavior).
     """
     pair_plans = _pair_plans(work_dir, tune_hdim_q, tune_hdim_v)
-    all_tile_plans: List[TilePlan] = []
+    all_tile_plans: list[TilePlan] = []
     for pp in pair_plans:
         if not pp.tiles_json.is_file():
             raise FileNotFoundError(
@@ -1761,9 +1756,9 @@ def cmd_run(args: argparse.Namespace) -> int:
 
 
 def _bench_stage_and_dump(
-    plans: List[TilePlan],
+    plans: list[TilePlan],
     meta: UntuneMeta,
-    max_seqlens: List[int],
+    max_seqlens: list[int],
     args: argparse.Namespace,
 ) -> int:
     """For each max_seqlen row: sweep all plans, keep top-1, emit tuned csv.
@@ -1782,7 +1777,7 @@ def _bench_stage_and_dump(
         return 1
 
     # Pre-collect the (binary, plan) pairs so we don't repeatedly stat().
-    ready: List[Tuple[str, TilePlan]] = []
+    ready: list[tuple[str, TilePlan]] = []
     for p in plans:
         b = _binary_path(str(p.build_dir), args.build_target)
         if not os.path.isfile(b):
@@ -1798,7 +1793,7 @@ def _bench_stage_and_dump(
     per_shape_dir = Path(args.work_dir).resolve() / "bench"
     per_shape_dir.mkdir(parents=True, exist_ok=True)
 
-    tuned_rows: List[Dict[str, Any]] = []
+    tuned_rows: list[dict[str, Any]] = []
 
     for row_idx, M in enumerate(max_seqlens):
         bench_args_list = _build_bench_args(
@@ -1822,7 +1817,7 @@ def _bench_stage_and_dump(
         )
         print(f"# args: {' '.join(shlex.quote(x) for x in bench_args_list)}")
 
-        per_tile_results: List[Dict[str, Any]] = []
+        per_tile_results: list[dict[str, Any]] = []
         for binary, p in ready:
             print(f"[bench max_s={M}] tile={p.tile.name}")
             status, perf = _do_bench(
