@@ -1,0 +1,3 @@
+group_id,mode,dtype,hdim_q,hdim_v,mask_type,signature,num_calls,uniq_shape_combos,total_q_tokens,total_k_tokens,uniq_seqlens_q,uniq_max_seqlen_q,uniq_batch,group_csv
+0,group,bf16,72,72,0,group_bf16_hq72_hv72_mask0,189,67,7507528,7507528,181,22,10,mha_group_0_group_bf16_hq72_hv72_mask0.csv
+1,group,bf16,256,256,2,group_bf16_hq256_hv256_mask2,78,77,1939690,1939690,689,73,3,mha_group_1_group_bf16_hq256_hv256_mask2.csv
