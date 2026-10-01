@@ -16,8 +16,9 @@ End-to-end pipeline:
         |                  its own build_<name>/ under that sub-dir)
         |
         |  3) bench     : for each max_seqlen row in the untune CSV, run every
-        |                 built binary in batch mode with -s=M -s_k=M, pick
-        |                 the top-1 (TFlops desc, time asc)
+        |                 built binary in group mode with -b=1 -s=M -s_k=M,
+        |                 pick the top-1 (TFlops desc, time asc). Only
+        |                 mode=group untune CSVs are accepted.
         |
         v
     mha_tuned_<...>.csv    (each row: metrics + human-readable tile_expr)
@@ -224,13 +225,15 @@ _PERF_RE = re.compile(
 _KNAME_RE = re.compile(r"(fmha_fwd_[A-Za-z0-9_]+)")
 
 # Untune CSV filename pattern (used to derive gid + suffix for naming the
-# tuned CSV output).
+# tuned CSV output). The optional `_<trait>...` tail is the full kernel-trait
+# signature written by mha_count_shape.py (nh/nhk + CK pipeline tokens);
+# legacy names ending at `mask<M>` still match.
 _UNTUNE_NAME_RE = re.compile(
     r"^mha_untune_(?P<gid>\d+)_"
     r"(?P<mode>[a-zA-Z0-9]+)_"
     r"(?P<dtype>[a-zA-Z0-9]+)_"
     r"hq(?P<hq>\d+)_hv(?P<hv>\d+)_"
-    r"mask(?P<mask>\d+)\.csv$"
+    r"mask(?P<mask>\d+)(?P<traits>(?:_[a-zA-Z0-9]+)*)\.csv$"
 )
 
 
@@ -563,6 +566,19 @@ def enumerate_tiles(
 # 2. Untune CSV IO
 # ===========================================================================
 
+# Only CK-tile group (varlen) fwd is tuned; batch / splitkv / appendkv /
+# pagedkv are rejected (mha_count_shape.py drops them before grouping).
+SUPPORTED_MODES = ("group",)
+
+
+def _require_supported_mode(mode: str, where: str) -> None:
+    if str(mode).strip().lower() not in SUPPORTED_MODES:
+        raise ValueError(
+            f"{where}: unsupported mode={mode!r}; only "
+            f"{'/'.join(SUPPORTED_MODES)} (varlen fwd) is supported by the "
+            f"MHA tuning workflow"
+        )
+
 
 @dataclass
 class UntuneMeta:
@@ -573,7 +589,7 @@ class UntuneMeta:
     """
 
     gid: int | None  # group id from filename ('0' etc.), maybe None
-    mode: str  # 'group' or 'batch'
+    mode: str  # always 'group' (only group/varlen fwd is supported)
     dtype: str  # 'bf16' / 'fp16'
     hdim_q: int  # from CSV / filename
     hdim_v: int
@@ -588,7 +604,7 @@ def parse_untune_csv(path: Path) -> tuple[UntuneMeta, list[int]]:
     The CSV must have header:
         max_seqlen, mode, dtype, hdim_q, hdim_v, mask_type
     All rows are assumed to share the same 5 group-key fields; we validate
-    that and error out on any mismatch.
+    that and error out on any mismatch. Only mode=group is accepted.
     """
     if not path.is_file():
         raise FileNotFoundError(f"untune csv not found: {path}")
@@ -609,6 +625,7 @@ def parse_untune_csv(path: Path) -> tuple[UntuneMeta, list[int]]:
 
     first = rows[0]
     mode = first["mode"].strip()
+    _require_supported_mode(mode, f"untune csv {path}")
     dtype = first["dtype"].strip()
     hdim_q = int(first["hdim_q"])
     hdim_v = int(first["hdim_v"])
@@ -738,6 +755,7 @@ def _filters_from_args(
     `filters`; build will overwrite it with the complete version.
     """
     mask_name = _mask_type_to_ck_name(int(meta.mask_type), DEFAULT_MASK_IMPL)
+    _require_supported_mode(meta.mode, "_filters_from_args")
     bias_letter = getattr(args, "bias", None)
     bias_name = BIAS_LETTER_TO_CK_NAME.get(bias_letter) if bias_letter else None
 
@@ -1012,27 +1030,22 @@ def _build_bench_args(
     repeat: int,
     mode: str,
 ) -> list[str]:
-    """Assemble CLI for tile_example_fmha_fwd (b=1, mode matches build).
+    """Assemble CLI for tile_example_fmha_fwd (b=1, group mode).
 
     The kernel instances emitted by CustomTuneFactory are strictly filtered on
-    `filters.mode` (see JSON), which in practice comes from the untune CSV's
-    filename (`_group_` / `_batch_`). The example runner's dispatcher looks
+    `filters.mode` (see JSON), which comes from the untune CSV (always
+    `group`; batch is rejected). The example runner's dispatcher looks
     up instances by `fmha_fwd_traits`, so `-mode` must match what we compiled
     or the runner exits with ", not supported yet".
 
     In group mode with `-b=1 -s=M -s_k=M`, the runner treats the single batch
-    as one variable-length sequence of length M -- exactly equivalent to the
-    batch-mode single-sequence shape, so downstream metrics are comparable.
+    as one variable-length sequence of length M.
     """
-    mode_int = {"batch": 0, "group": 1}.get(mode.lower())
-    if mode_int is None:
-        raise ValueError(
-            f"_build_bench_args: unsupported mode={mode!r} "
-            "(expected 'batch' or 'group')"
-        )
+    _require_supported_mode(mode, "_build_bench_args")
+    mode_int = 1  # tile_example_fmha_fwd: 0=batch, 1=group
     return [
         f"-prec={dtype}",
-        f"-mode={mode_int}",  # 0:batch, 1:group
+        f"-mode={mode_int}",
         "-b=1",  # single sequence
         f"-h={nhead_q}",
         f"-h_k={nhead_k}",

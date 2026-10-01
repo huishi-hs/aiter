@@ -16,9 +16,10 @@ same directory as this README:
   `CK_TILE_FMHA_FWD_CUSTOM_TUNE_CONFIG_FILE`.
 
 > **Scope of validation.** Only the CK-tile forward path in
-> **group (varlen) mode** has been end-to-end validated with this
-> workflow so far. **Batch mode** is dumped but has **not** been
-> thoroughly tested. splitkv, appendkv, pagedkv, `mha_batch_prefill` and
+> **group (varlen) mode** is supported and has been end-to-end validated
+> with this workflow. **Batch mode** is dumped but **rejected by the
+> tooling** (dropped by `mha_count_shape.py group`, refused by
+> `mha_tune.py`). splitkv, appendkv, pagedkv, `mha_batch_prefill` and
 > `fmha_v3_varlen_fwd` are **not dumped and not supported** (see
 > [Dump coverage](#dump-coverage)); backward is not covered.
 
@@ -146,7 +147,7 @@ dimensions so the tooling can tell them apart.
 
 ## 2. Process the log into per-group / per-sweep CSVs
 
-### 2.1 Group by `(mode, dtype, hdim_q, hdim_v, mask_type)`
+### 2.1 Group by every kernel-selecting field
 
 ```bash
 python mha_count_shape.py group -i /path/to/logs/workload.log -d ./mha_logs/
@@ -158,6 +159,56 @@ combinations sorted by observed count), plus a cross-group
 `mha_groups_summary.csv`, and prints per-group `max_seqlen_q` / `seqlens_q`
 / `seqlens_k` Top-K distributions on the terminal to help you pick the
 tuning sweep.
+
+**Group key and file name.** Records are grouped by every field that
+changes CK-tile fwd kernel selection (`fmha_fwd_traits` in
+`csrc/cpp_itfs/mha_fwd.cu`) plus the head counts. All of them are written
+as columns of the group / untune CSV and encoded in `<sig>` in a fixed
+order, defaults included:
+
+```
+<mode>_<dtype>_hq<HQ>_hv<HV>_mask<M>_nh<NQ>_nhk<NK>_<logits>_<bias>_<lse>_<dropout>_<skip>_<qscale>_<sink>
+e.g. group_bf16_hq256_hv256_mask2_nh16_nhk2_nlogits_nbias_nlse_ndropout_skip_nqscale_nsink
+```
+
+| Token       | Column                          | Values                                                        |
+|-------------|---------------------------------|---------------------------------------------------------------|
+| `mask<M>`   | `mask_type`                     | `0` no mask, `1` causal top-left, `2` causal bottom-right     |
+| `nh`/`nhk`  | `nhead_q` / `nhead_k`           | head counts (GQA when different)                              |
+| `<logits>`  | `has_logits_soft_cap`           | `nlogits` / `logits`                                          |
+| `<bias>`    | `bias_type`                     | `nbias` / `bias` (elementwise) / `alibi`                      |
+| `<lse>`     | `has_lse`                       | `nlse` / `lse`                                                |
+| `<dropout>` | `has_dropout`                   | `ndropout` / `dropout`                                        |
+| `<skip>`    | `skip_min_seqlen_q`             | `nskip` / `skip` (`min_seqlen_q != 0`)                        |
+| `<qscale>`  | `qscale_type`                   | `nqscale` / `pertensor` / `blockscale` / `kv_blockscale` / `mx` |
+| `<sink>`    | `has_sink`                      | `nsink` / `sink`                                              |
+
+The trait tokens follow CK-tile's pipeline naming (`FmhaFwdPipeline.name`
+in `example/ck_tile/01_fmha/codegen/ops/fmha_fwd.py`), so they read the same
+as the `best_kname` in the tuned CSV. `mask` stays numeric because CK's
+`_mask`/`_nmask` does not distinguish top-left from bottom-right causal.
+`generate_tune_range` and `mha_tune.py` only swap the filename prefix
+(`mha_group_` -> `mha_untune_` -> `mha_tuned_`) and keep `<sig>`; legacy
+`..._mask<M>.csv` names are still accepted.
+
+**Supported-scope filter.** Before grouping, records the workflow cannot
+tune are dropped. Each record is checked in this order and counted under
+the first matching reason:
+
+| Reason            | Condition                                                         |
+|-------------------|-------------------------------------------------------------------|
+| `batch`           | `mode != group`                                                   |
+| `sliding_window`  | window is neither no-mask `(-1,-1)` (`mask_type=0`) nor causal `(-1,0)` (`mask_type!=0`) |
+| `sink`            | `sink_size > 0` or `has_sink != 0`                                |
+| `logits_soft_cap` | `has_logits_soft_cap != 0`                                        |
+| `qscale`          | `qscale_type != 0`                                                |
+
+Records with `min_seqlen_q != 0` are **kept** (they select the
+`skip_min_seqlen_q` kernel variant). The terminal prints
+`[STAT] kept N / dropped M (batch=..., ...)` and the counts are written to
+`mha_dropped_summary.csv` (columns `reason, mode, dtype, hdim_q, hdim_v,
+mask_type, num_calls, total_q_tokens`; header only if nothing was
+dropped). If no record survives the filter, `group` exits with an error.
 
 Key options (`mha_count_shape.py group --help` for the full list):
 
@@ -343,7 +394,7 @@ different tuned tiles at runtime.
 | Path / feature                                | Status                              |
 |-----------------------------------------------|-------------------------------------|
 | CK-tile forward, **group (varlen)** mode      | **End-to-end validated.**           |
-| CK-tile forward, **batch** mode               | Wired through, **not** validated.   |
+| CK-tile forward, **batch** mode               | Dumped, **rejected by tooling**.    |
 | CK-tile forward, splitkv / appendkv / pagedkv | **Not dumped, not supported.**      |
 | CK-tile forward, `fmha_batch_prefill`         | **Not dumped, not supported.**      |
 | Backward pass                                 | **Not covered.**                    |

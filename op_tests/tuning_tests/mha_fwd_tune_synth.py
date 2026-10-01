@@ -10,6 +10,8 @@ needed. The formats mirror what the real producers emit:
 * `make_dump_line`   -> one `[MHA_FWD] ...` line as written by
                         `csrc/include/mha_fwd_dump.h` / `mha_common.h`.
 * `write_dump_log`   -> a log file made of such lines.
+* `write_untune_csv` -> a `mha_untune_*.csv` as written by
+                        `mha_count_shape.py generate_tune_range`.
 * `make_tile_expr`   -> a `best_tile_expr` string as written by `mha_tune.py`.
 * `write_tuned_csv`  -> a `mha_tuned_*.csv` with the same columns
                         `mha_tune.py` writes.
@@ -175,6 +177,32 @@ def write_dump_log(path: Path, lines: Iterable[str], noise: bool = True) -> Path
         if noise:
             out.append("")
     path.write_text("\n".join(out) + "\n", encoding="utf-8")
+    return path
+
+
+def write_untune_csv(
+    path: Path,
+    max_seqlens: Iterable[int],
+    meta: Mapping[str, Any] | None = None,
+) -> Path:
+    """Write a synthetic `mha_untune_*.csv` as produced by
+    `mha_count_shape.py generate_tune_range` (one row per max_seqlen)."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    base = {
+        "mode": "group",
+        "dtype": "bf16",
+        "hdim_q": 72,
+        "hdim_v": 72,
+        "mask_type": 0,
+    }
+    base.update(meta or {})
+    fieldnames = ["max_seqlen", *base.keys()]
+    with path.open("w", newline="", encoding="utf-8") as fp:
+        writer = csv.DictWriter(fp, fieldnames=fieldnames)
+        writer.writeheader()
+        for m in max_seqlens:
+            writer.writerow({"max_seqlen": m, **base})
     return path
 
 

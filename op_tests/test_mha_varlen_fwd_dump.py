@@ -27,8 +27,7 @@ import torch
 
 CAPTURE_WARNING = "skipping dump during stream capture"
 
-_CHILD = textwrap.dedent(
-    """
+_CHILD = textwrap.dedent("""
     import sys
     import torch
     import aiter
@@ -79,8 +78,7 @@ _CHILD = textwrap.dedent(
     for _, out in graphs:
         torch.testing.assert_close(out, ref)
     print("CAPTURE_OK")
-    """
-)
+    """)
 
 
 def _run_child(mode: str, stride: int, log_path: str):

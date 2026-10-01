@@ -92,13 +92,16 @@ _TILE_EXPR_RE = re.compile(
 )
 
 # Untune / tuned filename pattern (validation only). Matches:
-#   mha_tuned_<gid>_<mode>_<dtype>_hq<HQ>_hv<HV>_mask<M>.csv
+#   mha_tuned_<gid>_<mode>_<dtype>_hq<HQ>_hv<HV>_mask<M>[_<trait>...].csv
+# The optional trait tail (nh/nhk + CK pipeline tokens such as
+# _nlogits_nbias_nlse_ndropout_skip_nqscale_nsink) is written by
+# mha_count_shape.py; legacy names ending at `mask<M>` still match.
 _TUNED_NAME_RE = re.compile(
     r"^mha_tuned_(?P<gid>\d+)_"
     r"(?P<mode>[a-zA-Z0-9]+)_"
     r"(?P<dtype>[a-zA-Z0-9]+)_"
     r"hq(?P<hq>\d+)_hv(?P<hv>\d+)_"
-    r"mask(?P<mask>\d+)\.csv$"
+    r"mask(?P<mask>\d+)(?P<traits>(?:_[a-zA-Z0-9]+)*)\.csv$"
 )
 
 
