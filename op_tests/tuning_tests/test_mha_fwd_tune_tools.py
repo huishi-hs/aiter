@@ -10,6 +10,9 @@ aiter import is required.  Run:
     python3 -m unittest op_tests.tuning_tests.test_mha_fwd_tune_tools -v
 """
 
+import argparse
+import contextlib
+import io
 import sys
 import tempfile
 import unittest
@@ -154,6 +157,137 @@ class TestSynthRoundTrip(unittest.TestCase):
         self.assertEqual(lc.mask_type, 2)
         self.assertEqual((lc.compiled_hdim_q, lc.compiled_hdim_v), (80, 96))
         self.assertEqual([r["max_seqlen"] for r in lc.rows], [1024, 2048, 4096])
+
+
+def _parse_lines(*lines, noise=True):
+    with tempfile.TemporaryDirectory() as td:
+        log = synth.write_dump_log(Path(td) / "dump.log", lines, noise=noise)
+        return mha_count_shape.parse_log(log)
+
+
+class TestParseLog(unittest.TestCase):
+    """C4: strict parsing of the extended dump format (group + batch)."""
+
+    def test_group_new_fields(self):
+        line = synth.make_dump_line(
+            seqlens_q=[300, 700],
+            seqlens_k=[310, 720],
+            mask_type=2,
+            window_left=-1,
+            window_right=0,
+            sink_size=4,
+            has_sink=1,
+            has_logits_soft_cap=1,
+            qscale_type=1,
+            min_seqlen_q=2,
+        )
+        (r,) = _parse_lines(line)
+        self.assertEqual(r["mode"], "group")
+        self.assertEqual((r["window_left"], r["window_right"]), (-1, 0))
+        self.assertEqual(r["sink_size"], 4)
+        self.assertEqual(r["has_sink"], 1)
+        self.assertEqual(r["has_logits_soft_cap"], 1)
+        self.assertEqual(r["qscale_type"], 1)
+        self.assertEqual(r["min_seqlen_q"], 2)
+        self.assertEqual(r["seqlens_q"], [300, 700])
+        self.assertEqual(r["seqlens_k"], [310, 720])
+        self.assertEqual((r["total_q"], r["total_k"]), (1000, 1030))
+
+    def test_group_defaults_no_mask(self):
+        (r,) = _parse_lines(synth.make_dump_line())
+        self.assertEqual((r["window_left"], r["window_right"]), (-1, -1))
+        self.assertEqual(
+            (r["sink_size"], r["has_sink"], r["has_logits_soft_cap"]), (0, 0, 0)
+        )
+        self.assertEqual((r["qscale_type"], r["min_seqlen_q"]), (0, 0))
+
+    def test_batch_new_format(self):
+        line = synth.make_dump_line(
+            seqlens_q=[512] * 4, mode="batch", seqlens_k=[1024] * 4
+        )
+        (r,) = _parse_lines(line)
+        self.assertEqual(r["mode"], "batch")
+        self.assertEqual(r["batch"], 4)
+        self.assertEqual((r["seqlen_q"], r["seqlen_k"]), (512, 1024))
+        for f in ("min_seqlen_q", "total_q", "total_k", "seqlens_q", "seqlens_k"):
+            self.assertNotIn(f, r)
+        self.assertEqual(r["window_left"], -1)
+
+    def test_mixed_group_and_batch(self):
+        recs = _parse_lines(
+            synth.make_dump_line(seqlens_q=[128]),
+            synth.make_dump_line(seqlens_q=[256, 256], mode="batch"),
+        )
+        self.assertEqual([r["mode"] for r in recs], ["group", "batch"])
+
+    def test_banner_line_skipped(self):
+        banner = "[MHA_FWD] AITER_DUMP_MHA_FWD_INFO enabled, writing to /tmp/x.log"
+        recs = _parse_lines(banner, synth.make_dump_line())
+        self.assertEqual(len(recs), 1)
+
+    def _assert_missing(self, line, field):
+        with self.assertRaises(ValueError) as cm:
+            _parse_lines(line, noise=False)
+        msg = str(cm.exception)
+        self.assertIn(field, msg)
+        self.assertIn("re-dump", msg)
+        self.assertIn(":1:", msg)  # line number of the offending record
+
+    def test_missing_common_field(self):
+        for field in mha_count_shape.COMMON_REQUIRED:
+            if field == "mode":
+                continue
+            with self.subTest(field=field):
+                self._assert_missing(synth.make_dump_line(drop=[field]), field)
+
+    def test_old_format_rejected(self):
+        old = synth.make_dump_line(
+            drop=[
+                "window_left",
+                "window_right",
+                "sink_size",
+                "has_sink",
+                "has_logits_soft_cap",
+                "qscale_type",
+                "min_seqlen_q",
+            ]
+        )
+        self._assert_missing(old, "window_left")
+
+    def test_group_missing_specific(self):
+        for field in mha_count_shape.MODE_REQUIRED["group"]:
+            with self.subTest(field=field):
+                self._assert_missing(synth.make_dump_line(drop=[field]), field)
+
+    def test_batch_missing_specific(self):
+        for field in mha_count_shape.MODE_REQUIRED["batch"]:
+            with self.subTest(field=field):
+                self._assert_missing(
+                    synth.make_dump_line(mode="batch", drop=[field]), field
+                )
+
+    def test_unknown_or_missing_mode(self):
+        for mode in ("splitkv", None):
+            with self.subTest(mode=mode):
+                line = synth.make_dump_line(mode=mode)
+                with self.assertRaises(ValueError) as cm:
+                    _parse_lines(line)
+                self.assertIn("unknown mode", str(cm.exception))
+
+    def test_cmd_group_exits_on_bad_log(self):
+        with tempfile.TemporaryDirectory() as td:
+            log = synth.write_dump_log(
+                Path(td) / "dump.log", [synth.make_dump_line(drop=["qscale_type"])]
+            )
+            args = argparse.Namespace(
+                input_log=str(log), out_dir=str(Path(td) / "out"), topk=5
+            )
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf), self.assertRaises(SystemExit) as cm:
+                mha_count_shape.cmd_group(args)
+        self.assertEqual(cm.exception.code, 1)
+        self.assertIn("[ERROR]", buf.getvalue())
+        self.assertIn("qscale_type", buf.getvalue())
 
 
 if __name__ == "__main__":

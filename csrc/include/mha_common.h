@@ -237,6 +237,8 @@ inline void dump_mha_fwd_info_group(const mha_fwd_args& a,
         has_k_varlen_info = true;
     }
 
+    // min_seqlen_q != 0 selects the skip_min_seqlen_q kernel variant.
+    os << " min_seqlen_q=" << a.min_seqlen_q;
     os << " total_q=" << total_q;
     if(has_k_varlen_info)
         os << " total_k=" << total_k;

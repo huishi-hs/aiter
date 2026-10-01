@@ -17,11 +17,10 @@ same directory as this README:
 
 > **Scope of validation.** Only the CK-tile forward path in
 > **group (varlen) mode** has been end-to-end validated with this
-> workflow so far. **Batch mode** and other MHA variants (backward,
-> splitkv, appendkv, pagedkv, `mha_batch_prefill`, ...) are wired
-> through the same infrastructure but have **not** been thoroughly
-> tested; treat them as best-effort and verify manually before rolling
-> them into production.
+> workflow so far. **Batch mode** is dumped but has **not** been
+> thoroughly tested. splitkv, appendkv, pagedkv, `mha_batch_prefill` and
+> `fmha_v3_varlen_fwd` are **not dumped and not supported** (see
+> [Dump coverage](#dump-coverage)); backward is not covered.
 
 ---
 
@@ -90,6 +89,48 @@ AITER_DUMP_MHA_FWD_INFO_FILE=/path/to/logs/workload.log \
 `max_seqlen_q` bucket without producing gigabytes of log. Aggregating
 across multiple runs is fine &mdash; just `cat run1.log run2.log > combined.log`
 before Step 2.
+
+### Dump coverage
+
+Only plain forward calls are dumped:
+
+| Entry point                                              | Dumped? | `mode=` |
+|----------------------------------------------------------|---------|---------|
+| `mha_varlen_fwd` (CK, no `block_table`)                  | Yes     | `group` |
+| batch fwd, only when dispatched to CK (`fmha_fwd_ck`)    | Yes     | `batch` |
+| splitkv / pagedkv (`mha_varlen_fwd` with `block_table`)  | **No**  | &ndash; |
+| appendkv                                                 | **No**  | &ndash; |
+| `mha_batch_prefill`                                      | **No**  | &ndash; |
+| `fmha_v3_varlen_fwd` (asm v3 varlen entry)               | **No**  | &ndash; |
+
+Batch calls that are served by the asm v3 path are not recorded either.
+These paths are currently **not supported** by the tuning workflow, so
+the log will never contain them.
+
+### Record format
+
+```
+[MHA_FWD] mode=group dtype=bf16 hdim_q=72 hdim_v=72 nhead_q=16 nhead_k=16
+          batch=2 max_seqlen_q=4176 mask_type=0 bias_type=0 has_lse=0
+          has_dropout=0 window_left=-1 window_right=-1 sink_size=0
+          has_sink=0 has_logits_soft_cap=0 qscale_type=0
+          min_seqlen_q=0 total_q=5164 total_k=5164
+          seqlens_q=[988,4176] seqlens_k=[988,4176]
+```
+
+(One line per call; wrapped here for readability.) `mode=batch` records
+carry the same common fields followed by scalar `seqlen_q` / `seqlen_k`
+instead of `min_seqlen_q` / `total_*` / `seqlens_*`.
+
+`window_left/right`, `sink_size`, `has_sink`, `has_logits_soft_cap` and
+`qscale_type` (common) and `min_seqlen_q` (group; non-zero selects the
+`skip_min_seqlen_q` kernel variant) record the remaining kernel-trait
+dimensions so the tooling can tell them apart.
+
+> **Incompatible with older logs.** `mha_count_shape.py` validates every
+> record and aborts with `[ERROR] <file>:<line>: ... missing fields [...]`
+> if a field is absent. Logs captured with an older aiter build must be
+> re-collected with the current build.
 
 ---
 
@@ -293,8 +334,8 @@ different tuned tiles at runtime.
 |-----------------------------------------------|-------------------------------------|
 | CK-tile forward, **group (varlen)** mode      | **End-to-end validated.**           |
 | CK-tile forward, **batch** mode               | Wired through, **not** validated.   |
-| CK-tile forward, splitkv / appendkv / pagedkv | Wired through, **not** validated.   |
-| CK-tile forward, `fmha_batch_prefill`         | Wired through, **not** validated.   |
+| CK-tile forward, splitkv / appendkv / pagedkv | **Not dumped, not supported.**      |
+| CK-tile forward, `fmha_batch_prefill`         | **Not dumped, not supported.**      |
 | Backward pass                                 | **Not covered.**                    |
 
 Anything outside the "validated" row above should be treated as

@@ -25,8 +25,8 @@ from collections.abc import Iterable, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
-# Field order of a group-mode dump line (see mha_fwd_dump.h).
-_GROUP_FIELD_ORDER = (
+# Field order of a dump line (see mha_fwd_dump.h / mha_common.h).
+_COMMON_FIELD_ORDER = (
     "mode",
     "dtype",
     "hdim_q",
@@ -39,11 +39,22 @@ _GROUP_FIELD_ORDER = (
     "bias_type",
     "has_lse",
     "has_dropout",
+    "window_left",
+    "window_right",
+    "sink_size",
+    "has_sink",
+    "has_logits_soft_cap",
+    "qscale_type",
+)
+_GROUP_FIELD_ORDER = (
+    *_COMMON_FIELD_ORDER,
+    "min_seqlen_q",
     "total_q",
     "total_k",
     "seqlens_q",
     "seqlens_k",
 )
+_BATCH_FIELD_ORDER = (*_COMMON_FIELD_ORDER, "seqlen_q", "seqlen_k")
 
 # Columns written by mha_tune.py for a tuned csv (keep in sync with the
 # `fieldnames` list at the end of mha_tune.py's bench stage).
@@ -80,21 +91,29 @@ def _fmt(v: Any) -> str:
 def make_dump_line(
     seqlens_q: Sequence[int] = (1024,),
     seqlens_k: Sequence[int] | None = None,
+    mode: str = "group",
+    drop: Iterable[str] = (),
     **fields: Any,
 ) -> str:
-    """Return one group-mode `[MHA_FWD]` dump line.
+    """Return one `[MHA_FWD]` dump line.
 
-    Defaults describe a bf16, hdim 72/72, 16/16 heads, no-mask call. Any
-    field may be overridden via kwargs; extra (unknown) kwargs are appended
-    after the known fields in the given order, which lets later tests add
-    new dump fields (e.g. `api`, `window_left`) without touching this file.
-    Passing a field value of `None` drops it from the line (useful to
-    emulate older log formats).
+    Defaults describe a bf16, hdim 72/72, 16/16 heads, no-mask call
+    (window -1/-1, no sink, no soft-cap, no qscale, min_seqlen_q=0).
+
+    `mode="group"` emits the varlen fields (min_seqlen_q, total_q/k,
+    seqlens_q/k). `mode="batch"` emits scalar `seqlen_q`/`seqlen_k` taken
+    from `seqlens_q[0]`/`seqlens_k[0]`, with `batch=len(seqlens_q)`.
+    Any other `mode` value is written verbatim with the group layout.
+
+    Any field may be overridden via kwargs; extra (unknown) kwargs are
+    appended after the known fields in the given order. Passing a field
+    value of `None` (or listing its name in `drop`) omits it from the line,
+    which is useful to emulate older or malformed log formats.
     """
     sq = list(seqlens_q)
     sk = list(seqlens_k) if seqlens_k is not None else list(sq)
     rec: dict[str, Any] = {
-        "mode": "group",
+        "mode": mode,
         "dtype": "bf16",
         "hdim_q": 72,
         "hdim_v": 72,
@@ -106,21 +125,39 @@ def make_dump_line(
         "bias_type": 0,
         "has_lse": 0,
         "has_dropout": 0,
-        "total_q": sum(sq),
-        "total_k": sum(sk),
-        "seqlens_q": sq,
-        "seqlens_k": sk,
+        "window_left": -1,
+        "window_right": -1,
+        "sink_size": 0,
+        "has_sink": 0,
+        "has_logits_soft_cap": 0,
+        "qscale_type": 0,
     }
+    if mode == "batch":
+        order = _BATCH_FIELD_ORDER
+        rec["seqlen_q"] = sq[0] if sq else 0
+        rec["seqlen_k"] = sk[0] if sk else 0
+    else:
+        order = _GROUP_FIELD_ORDER
+        rec.update(
+            {
+                "min_seqlen_q": 0,
+                "total_q": sum(sq),
+                "total_k": sum(sk),
+                "seqlens_q": sq,
+                "seqlens_k": sk,
+            }
+        )
     extra: list[str] = []
     for k, v in fields.items():
-        if k not in rec:
+        if k not in order:
             extra.append(k)
         rec[k] = v
 
+    dropped = set(drop)
     parts = [
         f"{k}={_fmt(rec[k])}"
-        for k in (*_GROUP_FIELD_ORDER, *extra)
-        if rec.get(k) is not None
+        for k in (*order, *extra)
+        if rec.get(k) is not None and k not in dropped
     ]
     return "[MHA_FWD] " + " ".join(parts)
 

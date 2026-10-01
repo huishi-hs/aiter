@@ -53,17 +53,50 @@ from collections import Counter, OrderedDict
 from pathlib import Path
 
 # --------------------------------------------------------------------------- #
-# Log format (strictly aligned with the output emitted by mha_fwd_dump.h):
+# Log format (strictly aligned with the output emitted by mha_fwd_dump.h /
+# mha_common.h):
 #   [MHA_FWD] mode=group dtype=bf16 hdim_q=72 hdim_v=72 nhead_q=16 nhead_k=16
 #            batch=9 max_seqlen_q=4176 mask_type=0 bias_type=0 has_lse=0
-#            has_dropout=0 total_q=29596 total_k=29596
+#            has_dropout=0 window_left=-1 window_right=-1 sink_size=0
+#            has_sink=0 has_logits_soft_cap=0 qscale_type=0
+#            min_seqlen_q=0 total_q=29596 total_k=29596
 #            seqlens_q=[988,1736,2500,3772,4144,4032,4144,4176,4104]
 #            seqlens_k=[988,1736,2500,3772,4144,4032,4144,4176,4104]
-# In batch mode, total_q/total_k/seqlens_* are absent and replaced by the
-# scalars seqlen_q/seqlen_k.
+# In batch mode, min_seqlen_q/total_q/total_k/seqlens_* are absent and
+# replaced by the scalars seqlen_q/seqlen_k.
+#
+# Only plain fwd calls are dumped (group/varlen fwd and batch fwd on CK);
+# splitkv / pagedkv / appendkv / batch_prefill never appear in the log.
+# Logs from older aiter builds lack the window/sink/... fields and are
+# rejected by parse_log(): re-dump with the current aiter.
 # --------------------------------------------------------------------------- #
 KV_RE = re.compile(r"(\w+)=([^\s\[]+|\[[^\]]*\])")
 INT_LIST = re.compile(r"-?\d+")
+
+COMMON_REQUIRED = (
+    "mode",
+    "dtype",
+    "hdim_q",
+    "hdim_v",
+    "nhead_q",
+    "nhead_k",
+    "batch",
+    "max_seqlen_q",
+    "mask_type",
+    "bias_type",
+    "has_lse",
+    "has_dropout",
+    "window_left",
+    "window_right",
+    "sink_size",
+    "has_sink",
+    "has_logits_soft_cap",
+    "qscale_type",
+)
+MODE_REQUIRED = {
+    "group": ("min_seqlen_q", "total_q", "total_k", "seqlens_q", "seqlens_k"),
+    "batch": ("seqlen_q", "seqlen_k"),
+}
 
 GROUP_COLS = ("mode", "dtype", "hdim_q", "hdim_v", "mask_type")
 SUMMARY_NAME = "mha_groups_summary.csv"
@@ -81,16 +114,44 @@ def _parse_value(v: str):
         return v
 
 
+def _validate_record(rec, lineno, input_path):
+    mode = rec.get("mode")
+    if mode not in MODE_REQUIRED:
+        raise ValueError(
+            f"{input_path}:{lineno}: unknown mode={mode!r} "
+            f"(expected one of {sorted(MODE_REQUIRED)})"
+        )
+    missing = [c for c in (*COMMON_REQUIRED, *MODE_REQUIRED[mode]) if c not in rec]
+    if missing:
+        raise ValueError(
+            f"{input_path}:{lineno}: mode={mode} record is missing fields "
+            f"{missing}; the log was probably produced by an older aiter "
+            f"build, please re-dump with the current aiter"
+        )
+
+
 def parse_log(input_path: Path):
-    """Return list[dict], one per MHA forward call."""
+    """Return list[dict], one per MHA forward call.
+
+    Every `[MHA_FWD]` record must carry all COMMON_REQUIRED fields plus the
+    MODE_REQUIRED fields of its mode; otherwise ValueError is raised with
+    the offending line number and missing field names.
+    """
+    input_path = Path(input_path)
     records = []
     with input_path.open("r", encoding="utf-8") as f:
-        for line in f:
+        for lineno, line in enumerate(f, 1):
             line = line.strip()
             if not line or not line.startswith("[MHA_FWD]"):
                 continue
             body = line[len("[MHA_FWD]") :].strip()
+            # Skip the one-time banner the dumper prints on stderr
+            # ("[MHA_FWD] AITER_DUMP_MHA_FWD_INFO enabled, ...") in case
+            # stderr was merged into the log.
+            if body.startswith("AITER_DUMP_MHA_FWD_INFO"):
+                continue
             rec = {k: _parse_value(v) for k, v in KV_RE.findall(body)}
+            _validate_record(rec, lineno, input_path)
             records.append(rec)
     return records
 
@@ -112,7 +173,11 @@ def cmd_group(args):
         sys.exit(1)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    records = parse_log(input_path)
+    try:
+        records = parse_log(input_path)
+    except ValueError as e:
+        print(f"[ERROR] {e}")
+        sys.exit(1)
     if not records:
         print(f"[ERROR] No [MHA_FWD] lines parsed from: {input_path}")
         sys.exit(1)

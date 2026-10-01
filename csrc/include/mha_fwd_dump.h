@@ -169,6 +169,16 @@ inline void mha_dump_write(const std::string& line)
 }
 
 // Append fields shared by batch/group modes.
+//
+// Dump coverage: only the plain forward entry points emit records, i.e.
+// group/varlen fwd (mha_varlen_fwd, non-paged branch) and batch fwd when it
+// is dispatched to CK. splitkv / pagedkv (block_table) / appendkv /
+// mha_batch_prefill / fmha_v3_varlen_fwd are intentionally NOT dumped.
+//
+// Fields after `has_dropout` capture the remaining kernel-trait dimensions
+// (mask window, sink, logits soft-cap, quant scale) so the tooling can
+// filter/group on them. `has_logits_soft_cap` is emitted as 0/1 because
+// the kernel trait is a bool.
 inline void append_mha_common_fields(std::ostringstream& os,
                                      const mha_fwd_args& a,
                                      const char* mode)
@@ -185,7 +195,13 @@ inline void append_mha_common_fields(std::ostringstream& os,
        << " mask_type=" << a.mask_type
        << " bias_type=" << a.bias_type
        << " has_lse=" << (a.has_lse ? 1 : 0)
-       << " has_dropout=" << ((a.p_drop > 0.f) ? 1 : 0);
+       << " has_dropout=" << ((a.p_drop > 0.f) ? 1 : 0)
+       << " window_left=" << a.window_size_left
+       << " window_right=" << a.window_size_right
+       << " sink_size=" << a.sink_size
+       << " has_sink=" << (a.has_sink ? 1 : 0)
+       << " has_logits_soft_cap=" << ((a.logits_soft_cap > 0.f) ? 1 : 0)
+       << " qscale_type=" << a.qscale_type;
 }
 
 // Batch-mode dumper: only two extra scalar seqlens.
