@@ -78,6 +78,16 @@ prints `[MHA_FWD] AITER_DUMP_MHA_FWD_INFO enabled, writing to <path>` on
 stderr. Every completed record is `fflush()`-ed, so partial data
 survives external `SIGKILL`.
 
+**HIP/CUDA graph capture.** Calls issued while the launch stream is being
+captured (e.g. inside `torch.cuda.graph()`, vLLM/SGLang cudagraph capture)
+are **not dumped**; the dumper prints
+`[MHA_FWD] AITER_DUMP_MHA_FWD_INFO: skipping dump during stream capture ...`
+once per process and the forward call proceeds normally. Graph replays do
+not run host code, so they are never recorded either, and captured calls do
+not consume the sampling counter. To collect shapes from a graph-heavy
+workload, run it with graphs disabled (e.g. vLLM `--enforce-eager`) or rely
+on the eager calls (prefill) it still issues.
+
 ```bash
 # Example: sample 1-in-10 forward calls, write to a workload-specific path.
 AITER_DUMP_MHA_FWD_INFO=10 \

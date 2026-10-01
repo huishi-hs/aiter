@@ -145,9 +145,10 @@ def parse_log(input_path: Path):
             if not line or not line.startswith("[MHA_FWD]"):
                 continue
             body = line[len("[MHA_FWD]") :].strip()
-            # Skip the one-time banner the dumper prints on stderr
-            # ("[MHA_FWD] AITER_DUMP_MHA_FWD_INFO enabled, ...") in case
-            # stderr was merged into the log.
+            # Skip the one-time stderr notices the dumper prints
+            # ("[MHA_FWD] AITER_DUMP_MHA_FWD_INFO enabled, ..." and
+            # "[MHA_FWD] AITER_DUMP_MHA_FWD_INFO: skipping dump during
+            # stream capture ...") in case stderr was merged into the log.
             if body.startswith("AITER_DUMP_MHA_FWD_INFO"):
                 continue
             rec = {k: _parse_value(v) for k, v in KV_RE.findall(body)}

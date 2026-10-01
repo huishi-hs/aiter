@@ -225,6 +225,17 @@ class TestParseLog(unittest.TestCase):
         recs = _parse_lines(banner, synth.make_dump_line())
         self.assertEqual(len(recs), 1)
 
+    def test_capture_warning_line_skipped(self):
+        # Printed once on stderr by mha_dump_should_emit_on() when a call is
+        # graph-captured; must be ignored if stderr is merged into the log.
+        warning = (
+            "[MHA_FWD] AITER_DUMP_MHA_FWD_INFO: skipping dump during stream "
+            "capture (calls captured into or replayed from a HIP/CUDA graph "
+            "are not recorded). This warning is printed once."
+        )
+        recs = _parse_lines(warning, synth.make_dump_line())
+        self.assertEqual(len(recs), 1)
+
     def _assert_missing(self, line, field):
         with self.assertRaises(ValueError) as cm:
             _parse_lines(line, noise=False)
