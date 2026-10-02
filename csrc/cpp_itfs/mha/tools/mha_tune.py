@@ -20,7 +20,8 @@ End-to-end pipeline:
         |  3) bench     : for each max_seqlen row in the untune CSV, run every
         |                 built binary in group mode with -b=1 -s=M -s_k=M,
         |                 pick the top-1 (TFlops desc, time asc). Only
-        |                 mode=group untune CSVs are accepted.
+        |                 mode=group untune CSVs are accepted. Q/K lengths
+        |                 are always equal (seqlen_q != seqlen_k pending).
         |
         v
     mha_tuned_<gid>_<sig>.csv (each row: signature + bench_variant + metrics
@@ -1308,6 +1309,11 @@ def _build_bench_args(
 
     In group mode with `-b=1 -s=M -s_k=M`, the runner treats the single batch
     as one variable-length sequence of length M.
+
+    Known limitation: Q and K always have the same length (`-s_k` == `-s`).
+    Calls dumped with seqlen_q != seqlen_k (e.g. prefix-cached prefill) are
+    tuned by their Q length only (`mha_count_shape.py group` warns about
+    them); full seqlen_q != seqlen_k support is pending.
     """
     _require_supported_mode(mode, "_build_bench_args")
     mode_int = 1  # tile_example_fmha_fwd: 0=batch, 1=group

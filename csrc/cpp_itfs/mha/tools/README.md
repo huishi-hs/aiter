@@ -212,6 +212,23 @@ Records with `min_seqlen_q != 0` are **kept** (they select the
 mask_type, num_calls, total_q_tokens`; header only if nothing was
 dropped). If no record survives the filter, `group` exits with an error.
 
+**seqlen_q != seqlen_k (known limitation).** `mha_tune.py` benches every
+sample with `-s=M -s_k=M`, i.e. Q and K of equal length. After filtering,
+`group` counts the kept calls whose `seqlens_q` differ from `seqlens_k`
+(e.g. prefix-cached / chunked prefill) and prints
+
+```
+[WARN] <n> / <N> kept calls (<x>%, <y>% of total_q tokens) have seqlen_q != seqlen_k. mha_tune.py benches with -s=M -s_k=M, so these calls are tuned by seqlen_q (max_seqlen_q) only; full seqlen_q != seqlen_k support is pending. Pass --strict to abort.
+```
+
+plus a per-group `[WARN]` line and a `seqlen_mismatch_calls` column in
+`mha_groups_summary.csv`. These calls are **not dropped**: they are tuned
+by their Q length, which matches the runtime dispatch key
+(`a.max_seqlen_q`) but may pick a sub-optimal tile when `seqlen_k` is much
+larger than `seqlen_q`. Use `--strict` to fail instead. Full
+seqlen_q != seqlen_k support (sweeping `-s_k` and keying on K length) is
+planned as a follow-up.
+
 Key options (`mha_count_shape.py group --help` for the full list):
 
 - `-i / --input_log` &mdash; input log file (single file; concatenate
@@ -219,6 +236,8 @@ Key options (`mha_count_shape.py group --help` for the full list):
 - `-d / --out_dir` &mdash; output directory.
 - `--topk` &mdash; how many top entries to print per distribution
   (terminal only; CSVs always contain the full unique set).
+- `--strict` &mdash; exit with an error if any kept call has
+  seqlen_q != seqlen_k.
 
 ### 2.2 Expand a `max_seqlen` sweep per group
 
@@ -270,7 +289,8 @@ every signature column, all rows must agree, and the values must equal the
 ones encoded in the filename `<sig>`; otherwise `mha_tune.py` exits with an
 error naming the offending field. The signature drives both the codegen
 filters (CustomTuneFactory `filters` + `-DFMHA_FWD_GEN_FILTER`) and the
-bench CLI (`-h= -h_k= -mask= -bias= -lse=`).
+bench CLI (`-h= -h_k= -mask= -bias= -lse=`). `-s_k` always equals `-s`
+(see the seqlen_q != seqlen_k limitation in 2.1).
 
 **skip_min_seqlen_q limitation.** `tile_example_fmha_fwd` never sets
 `fmha_fwd_traits::skip_min_seqlen_q`, so it can only dispatch `_nskip`
@@ -411,6 +431,7 @@ different tuned tiles at runtime.
 | CK-tile forward, **batch** mode               | Dumped, **rejected by tooling**.    |
 | CK-tile forward, splitkv / appendkv / pagedkv | **Not dumped, not supported.**      |
 | CK-tile forward, `fmha_batch_prefill`         | **Not dumped, not supported.**      |
+| seqlen_q != seqlen_k (group mode)             | **Tuned by seqlen_q, with `[WARN]`;** full support pending. |
 | Backward pass                                 | **Not covered.**                    |
 
 Anything outside the "validated" row above should be treated as

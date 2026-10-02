@@ -14,6 +14,10 @@ Inspired by csrc/gemm_a16w16/countGemmShape.py. Split into two sub-commands:
         sink / logits-soft-cap / qscale and no dropout is tuned; batch
         mode and sliding windows are dropped). Drops are counted per reason and written to
         mha_dropped_summary.csv. min_seqlen_q != 0 records are kept.
+      - Count kept calls with seqlen_q != seqlen_k and print a [WARN]
+        (calls / token share); they are tuned by seqlen_q only because
+        mha_tune.py benches -s=M -s_k=M. --strict turns it into an error.
+        Full seqlen_q != seqlen_k support is pending.
       - Group the remaining records by every field that affects CK-tile
         kernel selection (GROUP_COLS): mode, dtype, hdim_q, hdim_v,
         mask_type, nhead_q, nhead_k, has_logits_soft_cap, bias_type,
@@ -297,6 +301,63 @@ def filter_supported(records):
     return kept, stats
 
 
+def has_seqlen_mismatch(rec):
+    """True if any sequence of the call has seqlen_q != seqlen_k.
+
+    mha_tune.py benches every sample with `-s=M -s_k=M` (equal Q/K length),
+    so such calls are tuned by their Q length only.
+    """
+    if rec.get("mode") == "batch":
+        return rec.get("seqlen_q") != rec.get("seqlen_k")
+    return list(rec.get("seqlens_q") or []) != list(rec.get("seqlens_k") or [])
+
+
+def seqlen_mismatch_stats(records):
+    """Return {'num_calls', 'mismatch_calls', 'total_q_tokens',
+    'mismatch_q_tokens'} over `records`."""
+    st = {
+        "num_calls": 0,
+        "mismatch_calls": 0,
+        "total_q_tokens": 0,
+        "mismatch_q_tokens": 0,
+    }
+    for r in records:
+        tq = record_total_q(r)
+        st["num_calls"] += 1
+        st["total_q_tokens"] += tq
+        if has_seqlen_mismatch(r):
+            st["mismatch_calls"] += 1
+            st["mismatch_q_tokens"] += tq
+    return st
+
+
+def _pct(num, den):
+    return num / den * 100 if den else 0.0
+
+
+def report_seqlen_mismatch(records, strict=False):
+    """Print a [WARN] (or [ERROR] with `strict`) for sq != sk calls.
+
+    Returns True when the caller should abort (strict and mismatches found).
+    """
+    st = seqlen_mismatch_stats(records)
+    n = st["mismatch_calls"]
+    if not n:
+        print("[STAT] seqlen_q == seqlen_k for every kept call")
+        return False
+    tag = "[ERROR]" if strict else "[WARN]"
+    print(
+        f"{tag} {n} / {st['num_calls']} kept calls "
+        f"({_pct(n, st['num_calls']):.1f}%, "
+        f"{_pct(st['mismatch_q_tokens'], st['total_q_tokens']):.1f}% of "
+        f"total_q tokens) have seqlen_q != seqlen_k. mha_tune.py benches "
+        f"with -s=M -s_k=M, so these calls are tuned by seqlen_q "
+        f"(max_seqlen_q) only; full seqlen_q != seqlen_k support is pending."
+        + (" Aborting (--strict)." if strict else " Pass --strict to abort.")
+    )
+    return strict
+
+
 def write_dropped_summary(out_dir: Path, stats):
     """Write DROPPED_SUMMARY_NAME (header only when nothing was dropped)."""
     path = Path(out_dir) / DROPPED_SUMMARY_NAME
@@ -390,6 +451,10 @@ def cmd_group(args):
         )
         sys.exit(1)
 
+    # ---------- Known limitation: equal Q/K length benches ---------- #
+    if report_seqlen_mismatch(records, strict=getattr(args, "strict", False)):
+        sys.exit(1)
+
     # ---------- Group-wise accumulation ---------- #
     #   groups[gkey] = {
     #       'num_calls', 'total_q_sum', 'total_k_sum',
@@ -413,9 +478,12 @@ def cmd_group(args):
                 "seqs_q_tok": Counter(),
                 "seqs_k_cnt": Counter(),
                 "seqs_k_tok": Counter(),
+                "seqlen_mismatch_calls": 0,
                 "shape_cnt": OrderedDict(),
             },
         )
+        if has_seqlen_mismatch(r):
+            g["seqlen_mismatch_calls"] += 1
         batch = r.get("batch", 1)
         tq = r.get("total_q")
         if tq is None:
@@ -509,6 +577,11 @@ def cmd_group(args):
         header = "  ".join(f"{k}={v}" for k, v in zip(GROUP_COLS, gkey))
         print(f"\n---------------- GROUP[{gid}]: {header} ----------------")
         print(f"  num_calls={g['num_calls']}, uniq_shape_combos={len(g['shape_cnt'])}")
+        if g["seqlen_mismatch_calls"]:
+            print(
+                f"[WARN] {g['seqlen_mismatch_calls']} / {g['num_calls']} calls "
+                f"in this group have seqlen_q != seqlen_k; tuned by seqlen_q"
+            )
 
         uniq_max = sorted(g["maxseq_cnt"].keys())
         print(f"[INPUT max_seqlen_q] {len(uniq_max)} unique values: {uniq_max}")
@@ -586,6 +659,7 @@ def cmd_group(args):
                     ("uniq_seqlens_q", len(g["seqs_q_cnt"])),
                     ("uniq_max_seqlen_q", len(g["maxseq_cnt"])),
                     ("uniq_batch", len(g["batch_cnt"])),
+                    ("seqlen_mismatch_calls", g["seqlen_mismatch_calls"]),
                     ("group_csv", str(rec_path.name)),
                 ]
             )
@@ -833,6 +907,13 @@ def main():
         "seqlens_q by token weight, and the same two for seqlens_k) "
         "(default: %(default)s). Only affects terminal output; CSVs "
         "always contain the full unique set.",
+    )
+    p1.add_argument(
+        "--strict",
+        action="store_true",
+        help="exit with an error if any kept call has seqlen_q != "
+        "seqlen_k. By default only a [WARN] is printed and such calls are "
+        "tuned by seqlen_q (mha_tune.py benches with -s=M -s_k=M).",
     )
     p1.set_defaults(func=cmd_group)
 

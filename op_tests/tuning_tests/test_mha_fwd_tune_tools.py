@@ -309,14 +309,20 @@ def _read_csv(path):
         return list(csv.DictReader(f))
 
 
-def _run_cmd_group(td, lines):
+def _run_cmd_group(td, lines, strict=False):
     """Run `cmd_group` on a synthetic log; return (out_dir, stdout)."""
     log = synth.write_dump_log(Path(td) / "dump.log", lines)
     out_dir = Path(td) / "out"
-    args = argparse.Namespace(input_log=str(log), out_dir=str(out_dir), topk=5)
+    args = argparse.Namespace(
+        input_log=str(log), out_dir=str(out_dir), topk=5, strict=strict
+    )
     buf = io.StringIO()
-    with contextlib.redirect_stdout(buf):
-        mha_count_shape.cmd_group(args)
+    try:
+        with contextlib.redirect_stdout(buf):
+            mha_count_shape.cmd_group(args)
+    except SystemExit as e:
+        e.stdout = buf.getvalue()
+        raise
     return out_dir, buf.getvalue()
 
 
@@ -456,6 +462,117 @@ class TestGroupFilter(unittest.TestCase):
             self.assertTrue((out_dir / mha_count_shape.DROPPED_SUMMARY_NAME).is_file())
             self.assertFalse((out_dir / mha_count_shape.SUMMARY_NAME).exists())
         self.assertEqual(cm.exception.code, 1)
+
+
+class TestSeqlenMismatch(unittest.TestCase):
+    """C7: seqlen_q != seqlen_k is warned about and tuned by seqlen_q."""
+
+    def _rec(self, **kw):
+        (r,) = _parse_lines(synth.make_dump_line(**kw))
+        return r
+
+    def test_has_seqlen_mismatch(self):
+        self.assertFalse(mha_count_shape.has_seqlen_mismatch(self._rec()))
+        self.assertTrue(
+            mha_count_shape.has_seqlen_mismatch(
+                self._rec(seqlens_q=[100, 200], seqlens_k=[100, 300])
+            )
+        )
+        self.assertTrue(
+            mha_count_shape.has_seqlen_mismatch(
+                self._rec(mode="batch", seqlens_q=[64], seqlens_k=[128])
+            )
+        )
+        self.assertFalse(
+            mha_count_shape.has_seqlen_mismatch(
+                self._rec(mode="batch", seqlens_q=[64, 64])
+            )
+        )
+
+    def test_stats(self):
+        recs = [
+            self._rec(seqlens_q=[100, 300]),
+            self._rec(seqlens_q=[100], seqlens_k=[900]),
+            self._rec(seqlens_q=[50, 50], seqlens_k=[50, 60]),
+            self._rec(seqlens_q=[400]),
+        ]
+        st = mha_count_shape.seqlen_mismatch_stats(recs)
+        self.assertEqual(
+            st,
+            {
+                "num_calls": 4,
+                "mismatch_calls": 2,
+                "total_q_tokens": 1000,
+                "mismatch_q_tokens": 200,
+            },
+        )
+
+    def _lines(self):
+        return [
+            synth.make_dump_line(seqlens_q=[1000, 2000]),
+            synth.make_dump_line(seqlens_q=[1000, 2000]),
+            synth.make_dump_line(seqlens_q=[500], seqlens_k=[1500]),
+            synth.make_dump_line(
+                seqlens_q=[512], hdim_q=256, hdim_v=256, nhead_k=2, **_CAUSAL
+            ),
+        ]
+
+    def test_cmd_group_warns_and_keeps(self):
+        with tempfile.TemporaryDirectory() as td:
+            out_dir, out = _run_cmd_group(td, self._lines())
+            summary = _read_csv(out_dir / mha_count_shape.SUMMARY_NAME)
+            hq72_csv = next(out_dir.glob("mha_group_*_hq72_*.csv"))
+            rows = _read_csv(hq72_csv)
+        self.assertIn(
+            "[WARN] 1 / 4 kept calls (25.0%, 7.1% of total_q tokens) "
+            "have seqlen_q != seqlen_k",
+            out,
+        )
+        self.assertIn("tuned by seqlen_q", out)
+        self.assertIn("full seqlen_q != seqlen_k support is pending", out)
+        by_hq = {r["hdim_q"]: r for r in summary}
+        self.assertEqual(by_hq["72"]["seqlen_mismatch_calls"], "1")
+        self.assertEqual(by_hq["72"]["num_calls"], "3")  # not dropped
+        self.assertEqual(by_hq["256"]["seqlen_mismatch_calls"], "0")
+        self.assertIn(("500", "1500"), {(r["seqlens_q"], r["seqlens_k"]) for r in rows})
+
+    def test_cmd_group_no_mismatch(self):
+        with tempfile.TemporaryDirectory() as td:
+            _, out = _run_cmd_group(td, self._lines()[:2])
+        self.assertIn("seqlen_q == seqlen_k for every kept call", out)
+        self.assertNotIn("[WARN]", out)
+
+    def test_cmd_group_strict(self):
+        with tempfile.TemporaryDirectory() as td:
+            with self.assertRaises(SystemExit) as cm:
+                _run_cmd_group(td, self._lines(), strict=True)
+            self.assertFalse((Path(td) / "out" / mha_count_shape.SUMMARY_NAME).exists())
+        self.assertEqual(cm.exception.code, 1)
+        self.assertIn("[ERROR] 1 / 4 kept calls", cm.exception.stdout)
+        self.assertIn("Aborting (--strict)", cm.exception.stdout)
+        # strict passes when everything is equal-length
+        with tempfile.TemporaryDirectory() as td:
+            _run_cmd_group(td, self._lines()[:2], strict=True)
+
+    def test_dropped_mismatch_not_counted(self):
+        lines = [
+            synth.make_dump_line(seqlens_q=[100]),
+            synth.make_dump_line(mode="batch", seqlens_q=[64], seqlens_k=[128]),
+        ]
+        with tempfile.TemporaryDirectory() as td:
+            _run_cmd_group(td, lines, strict=True)  # batch dropped first
+
+    def test_strict_cli_flag(self):
+        with tempfile.TemporaryDirectory() as td:
+            log = synth.write_dump_log(Path(td) / "d.log", self._lines())
+            argv = ["mha_count_shape.py", "group", "-i", str(log), "-d", td, "--strict"]
+            buf = io.StringIO()
+            with mock.patch.object(sys, "argv", argv), contextlib.redirect_stdout(
+                buf
+            ), self.assertRaises(SystemExit) as cm:
+                mha_count_shape.main()
+        self.assertEqual(cm.exception.code, 1)
+        self.assertIn("[ERROR]", buf.getvalue())
 
 
 _SIG_HQ72 = (
