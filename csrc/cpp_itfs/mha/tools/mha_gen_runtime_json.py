@@ -104,6 +104,27 @@ _TUNED_NAME_RE = re.compile(
     r"mask(?P<mask>\d+)(?P<traits>(?:_[a-zA-Z0-9]+)*)\.csv$"
 )
 
+# Full group signature columns written by mha_tune.py into every tuned csv
+# row. Must stay identical to mha_count_shape.GROUP_COLS and
+# mha_tune.SIGNATURE_COLS (asserted by the unit tests).
+SIGNATURE_COLS: tuple[str, ...] = (
+    "mode",
+    "dtype",
+    "hdim_q",
+    "hdim_v",
+    "mask_type",
+    "nhead_q",
+    "nhead_k",
+    "has_logits_soft_cap",
+    "bias_type",
+    "has_lse",
+    "has_dropout",
+    "skip_min_seqlen_q",
+    "qscale_type",
+    "has_sink",
+)
+_STR_SIGNATURE_COLS = frozenset({"mode", "dtype"})
+
 
 # ===========================================================================
 # CSV loading
@@ -137,6 +158,11 @@ class TunedCsv:
         self.compiled_hdim_q: int = 0
         self.compiled_hdim_v: int = 0
         self.mask_type: int = 0
+        # Full SIGNATURE_COLS values when the csv carries them (written by
+        # mha_tune.py since the signature columns were added), else None.
+        self.signature: dict[str, Any] | None = None
+        # Kernel variant actually benched ("skip" / "nskip"), if recorded.
+        self.bench_variant: str | None = None
         # Each entry: {"max_seqlen": int, "tile": {F_*: int, ...}}
         self.rows: list[dict[str, Any]] = []
 
@@ -173,8 +199,11 @@ class TunedCsv:
                 raise ValueError(
                     f"{obj.path}: missing required columns: {sorted(missing)}"
                 )
+            fields = set(reader.fieldnames or [])
+            has_sig = all(c in fields for c in SIGNATURE_COLS)
+            has_variant = "bench_variant" in fields
 
-            group_key_seen: tuple[str, str, int, int, int, int, int] | None = None
+            group_key_seen: tuple[Any, ...] | None = None
             for row in reader:
                 if row.get("status", "").strip() != "ok":
                     continue
@@ -189,12 +218,35 @@ class TunedCsv:
                     row_bhq = int(row["best_hdim_q"])
                     row_bhv = int(row["best_hdim_v"])
                     tile = _parse_tile_expr(row["best_tile_expr"])
-                except (KeyError, ValueError) as e:
+                    row_sig = (
+                        {
+                            c: (
+                                row[c].strip()
+                                if c in _STR_SIGNATURE_COLS
+                                else int(row[c])
+                            )
+                            for c in SIGNATURE_COLS
+                        }
+                        if has_sig
+                        else None
+                    )
+                    row_variant = row["bench_variant"].strip() if has_variant else None
+                except (KeyError, ValueError, AttributeError) as e:
                     raise ValueError(
                         f"{obj.path}: cannot parse row {row!r}: {e}"
                     ) from e
 
-                gk = (row_mode, row_dtype, row_hq, row_hv, row_mask, row_bhq, row_bhv)
+                gk = (
+                    row_mode,
+                    row_dtype,
+                    row_hq,
+                    row_hv,
+                    row_mask,
+                    row_bhq,
+                    row_bhv,
+                    tuple(sorted(row_sig.items())) if row_sig else None,
+                    row_variant,
+                )
                 if group_key_seen is None:
                     group_key_seen = gk
                     obj.mode = row_mode
@@ -204,6 +256,8 @@ class TunedCsv:
                     obj.compiled_hdim_q = row_bhq
                     obj.compiled_hdim_v = row_bhv
                     obj.mask_type = row_mask
+                    obj.signature = row_sig
+                    obj.bench_variant = row_variant
                 elif gk != group_key_seen:
                     raise ValueError(
                         f"{obj.path}: multiple group signatures found "
@@ -448,6 +502,8 @@ def build_merged_payload(
                     "compiled_hdim_q": lc.compiled_hdim_q,
                     "compiled_hdim_v": lc.compiled_hdim_v,
                     "mask_type": lc.mask_type,
+                    "signature": lc.signature,
+                    "bench_variant": lc.bench_variant,
                     "row_count": len(lc.rows),
                 }
                 for lc in loaded

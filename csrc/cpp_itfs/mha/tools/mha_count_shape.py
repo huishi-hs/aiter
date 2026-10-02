@@ -10,9 +10,9 @@ Inspired by csrc/gemm_a16w16/countGemmShape.py. Split into two sub-commands:
       python mha_count_shape.py group -i mha_fwd_1.txt -d mha_logs/
     Behavior:
       - Parse the log, then drop records outside the supported scope
-        (only group/varlen fwd with no-mask or causal masking and default
-        sink / logits-soft-cap / qscale is tuned; batch mode and sliding
-        windows are dropped). Drops are counted per reason and written to
+        (only group/varlen fwd with no-mask or causal masking, default
+        sink / logits-soft-cap / qscale and no dropout is tuned; batch
+        mode and sliding windows are dropped). Drops are counted per reason and written to
         mha_dropped_summary.csv. min_seqlen_q != 0 records are kept.
       - Group the remaining records by every field that affects CK-tile
         kernel selection (GROUP_COLS): mode, dtype, hdim_q, hdim_v,
@@ -47,8 +47,8 @@ Inspired by csrc/gemm_a16w16/countGemmShape.py. Split into two sub-commands:
     Behavior:
       - Read one group CSV produced by Step 1
         (mha_group_<gid>_<sig>.csv). The summary file is not required.
-      - Extract the group columns (GROUP_COLS; legacy CSVs: the first 5)
-        from the CSV first row and copy them into every output row.
+      - Extract the group columns (GROUP_COLS; all are required) from the
+        CSV first row and copy them into every output row.
       - --range S:E:STEP: may be given multiple times; each occurrence
         appends one closed-interval arithmetic segment.
       - --singletons a,b,c: extra discrete M values.
@@ -163,7 +163,7 @@ DROPPED_SUMMARY_NAME = "mha_dropped_summary.csv"
 # --------------------------------------------------------------------------- #
 # Supported scope: the tuning workflow only targets CK-tile group (varlen)
 # forward with plain no-mask / causal masking and default sink / soft-cap /
-# qscale settings. Every other record is dropped by `group` before grouping
+# qscale settings and without dropout. Every other record is dropped by `group` before grouping
 # and accounted for in DROPPED_SUMMARY_NAME. Reasons are checked in this
 # order and only the first matching one is reported per record.
 #
@@ -176,6 +176,9 @@ DROP_REASONS = (
     "sink",  # sink_size > 0 or has_sink != 0
     "logits_soft_cap",  # has_logits_soft_cap != 0
     "qscale",  # qscale_type != 0
+    # has_dropout != 0: the dump only records the on/off flag, not p_drop,
+    # so mha_tune.py cannot reproduce the call; pending future support.
+    "dropout",
 )
 NO_MASK_WINDOW = (-1, -1)
 CAUSAL_WINDOW = (-1, 0)
@@ -258,6 +261,8 @@ def drop_reason(rec):
         return "logits_soft_cap"
     if rec["qscale_type"] != 0:
         return "qscale"
+    if rec["has_dropout"] != 0:
+        return "dropout"
     return None
 
 
@@ -373,8 +378,8 @@ def cmd_group(args):
     print(
         f"[STAT] kept {len(records)} / dropped {n_dropped}"
         + (f" ({detail})" if detail else "")
-        + " -- only group-mode fwd with no-mask/causal and default "
-        "sink/soft-cap/qscale is tuned"
+        + " -- only group-mode fwd with no-mask/causal, default "
+        "sink/soft-cap/qscale and no dropout is tuned"
     )
     dropped_path = write_dropped_summary(out_dir, dropped)
     print(f"[WRITE] {dropped_path}  ({len(dropped)} dropped buckets)")
@@ -637,8 +642,8 @@ def cmd_generate_tune_range(args):
 
     # Read the first row of the group CSV to extract the group dimensions
     # (GROUP_COLS). All rows in this CSV share the same group dimensions
-    # (they come from the same Step 1 group). Legacy group CSVs that only
-    # carry BASE_GROUP_COLS are still accepted.
+    # (they come from the same Step 1 group). Legacy group CSVs without the
+    # full GROUP_COLS are rejected: re-run `group`.
     with in_csv.open("r", encoding="utf-8") as f:
         reader = csv.DictReader(f)
         rows_in = list(reader)
@@ -646,22 +651,15 @@ def cmd_generate_tune_range(args):
         print(f"[ERROR] Group CSV is empty: {in_csv}")
         sys.exit(1)
     present = set(rows_in[0].keys())
-    missing = [c for c in BASE_GROUP_COLS if c not in present]
-    trait_missing = [c for c in TRAIT_GROUP_COLS if c not in present]
-    if not missing and len(trait_missing) not in (0, len(TRAIT_GROUP_COLS)):
-        missing = trait_missing
+    missing = [c for c in GROUP_COLS if c not in present]
     if missing:
         print(
             f"[ERROR] Group CSV is missing columns {missing}; "
-            f"please confirm the input is a Step 1 mha_group_*.csv file"
+            f"please confirm the input is a Step 1 mha_group_*.csv file "
+            f"produced by the current `group` (re-run it for legacy CSVs)"
         )
         sys.exit(1)
-    key_cols = BASE_GROUP_COLS if trait_missing else GROUP_COLS
-    if trait_missing:
-        print(
-            f"[WARN] {in_csv.name} is a legacy group CSV without "
-            f"{list(TRAIT_GROUP_COLS)}; re-run `group` to get the full signature"
-        )
+    key_cols = GROUP_COLS
     group_vals = {c: rows_in[0][c] for c in key_cols}
 
     # Flatten --range / --singletons into a sorted set of M values.
@@ -774,8 +772,9 @@ def main():
             "\n"
             "Only group (varlen) fwd records with no-mask / causal masking\n"
             "and default sink / logits-soft-cap / qscale are kept; batch\n"
-            "mode, sliding window, sink, soft-cap and qscale records are\n"
-            "dropped and counted per reason in `mha_dropped_summary.csv`.\n"
+            "mode, sliding window, sink, soft-cap, qscale and dropout\n"
+            "records are dropped and counted per reason in\n"
+            "`mha_dropped_summary.csv`.\n"
             "\n"
             "For each group, this stage writes ONE CSV whose rows are the\n"
             "unique (seqlens_q, seqlens_k) combinations plus their\n"

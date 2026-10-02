@@ -6,7 +6,9 @@ MHA forward tuning driver (productionized version).
 
 End-to-end pipeline:
 
-    mha_untune_<gid>_<mode>_<dtype>_hq<HQ>_hv<HV>_mask<M>.csv
+    mha_untune_<gid>_<sig>.csv
+        (<sig> = <mode>_<dtype>_hq<HQ>_hv<HV>_mask<M>_nh<NQ>_nhk<NK>_<logits>_
+                 <bias>_<lse>_<dropout>_<skip>_<qscale>_<sink>)
         |
         |  1) enum      : enumerate legal FmhaFwdTileSize candidates for each
         |                 (tune-hdim-q, tune-hdim-v) pair
@@ -21,7 +23,8 @@ End-to-end pipeline:
         |                 mode=group untune CSVs are accepted.
         |
         v
-    mha_tuned_<...>.csv    (each row: metrics + human-readable tile_expr)
+    mha_tuned_<gid>_<sig>.csv (each row: signature + bench_variant + metrics
+                               + human-readable tile_expr)
 
 Sub-commands:
 
@@ -35,13 +38,11 @@ Sub-commands:
 Typical usage:
 
     python mha_tune.py run \\
-        -i /path/to/mha_untune_0_group_bf16_hq72_hv72_mask0.csv \\
+        -i /path/to/mha_untune_1_group_bf16_hq256_hv256_mask2_nh16_nhk2_nlogits_nbias_nlse_ndropout_skip_nqscale_nsink.csv \\
         --ck-root  /path/to/composable_kernel \\
-        --work-dir /tmp/mha_tune_hq72 \\
-        --tune-hdim-q 80 --tune-hdim-v 96 \\
-        --nhead-q 16 --nhead-k 2 \\
-        --bias n --lse 0 --p-drop 0.0 \\
-        --jobs 64 --workers 4 --allow-mfma-16
+        --work-dir /tmp/mha_tune_hq256 \\
+        --tune-hdim-q 256 --tune-hdim-v 256 \\
+        --jobs 64 --workers 4
 
 -------------------------------------------------------------------------
 Which options are used by which sub-command?
@@ -53,34 +54,20 @@ Which options are used by which sub-command?
 
   build / bench / run only:  --build-target / -j / -w / --cmake-opt /
                              --no-fresh / --stop-on-error / --dry-run
-                             --nhead-q / --nhead-k /
-                             --bias / --lse / --p-drop /
                              --warmup / --repeat
 
-Semantics of the runtime-shape options (only present on build/bench/run):
+Group signature (NOT command-line options):
 
-  --nhead-q / --nhead-k : passed to `tile_example_fmha_fwd -h= / -h_k=`
-                          when running the bench. They also flow into the
-                          FILTER block of the CustomTuneFactory JSON
-                          because CK codegen keys some pipeline variants
-                          on head counts. Match them to the numbers from
-                          your MHA_FWD dump log (nhead_q / nhead_k).
+  nhead_q / nhead_k, mask, bias, lse, dropout, skip_min_seqlen_q, ... are
+  read from the untune CSV (every row carries every signature column and
+  the filename encodes the same values; parse_untune_csv() rejects any
+  disagreement, missing column or legacy 5-field name). They drive both
+  the CustomTuneFactory `filters` (so codegen only compiles the matching
+  pipeline variant) and the bench CLI (`-h= -h_k= -mask= -bias= -lse=`).
 
-  --bias                : n = no bias, e = elementwise bias, a = ALiBi.
-                          Emitted as `-bias=<letter>` at bench time AND
-                          written into `filters.bias` of the tune-config
-                          JSON so codegen only compiles the matching
-                          pipeline variant. Match it to bias_type from
-                          the dump log.
-
-  --lse                 : 0 = do not write LSE, 1 = write LSE. Emitted as
-                          `-lse=<0|1>` and mirrored into `filters.lse`.
-                          Match to has_lse from the dump log.
-
-  --p-drop              : dropout probability (float). 0.0 disables
-                          dropout; any positive value flips
-                          `filters.dropout=t` and passes `-p_drop=` to
-                          the bench. Match to has_dropout from the log.
+  skip_min_seqlen_q=1 groups: tile_example_fmha_fwd cannot dispatch skip
+  kernels, so the nskip variant is built + benched instead, a [WARN] is
+  printed and the tuned CSV records bench_variant=nskip.
 
   --allow-mfma-16       : extends the enumerable bf16 mfma set from the
                           default [(32,32,16)] to also include
@@ -196,11 +183,148 @@ BIAS_LETTER_TO_CK_NAME: dict[str, str] = {
     "a": "alibi",
 }
 
+# bias_type integer (bias_enum, as dumped / stored in the untune CSV) ->
+# tile_example_fmha_fwd `-bias=` letter.
+BIAS_TYPE_TO_LETTER: dict[int, str] = {0: "n", 1: "e", 2: "a"}
+
+# ---------------------------------------------------------------------------
+# Group signature (single source of truth for mha_tune.py).
+#
+# Must stay identical to mha_count_shape.GROUP_COLS and
+# mha_gen_runtime_json.SIGNATURE_COLS (the tools directory is not a package,
+# so each script keeps its own copy; the unit tests assert they agree).
+#
+# The untune CSV carries every column on every row, and its filename
+#   mha_untune_<gid>_<mode>_<dtype>_hq<HQ>_hv<HV>_mask<M>_nh<NQ>_nhk<NK>_
+#     <logits>_<bias>_<lse>_<dropout>_<skip>_<qscale>_<sink>.csv
+# encodes the same values; parse_untune_csv() requires both to agree. There
+# are NO command-line overrides for these fields.
+# ---------------------------------------------------------------------------
+SIGNATURE_COLS: tuple[str, ...] = (
+    "mode",
+    "dtype",
+    "hdim_q",
+    "hdim_v",
+    "mask_type",
+    "nhead_q",
+    "nhead_k",
+    "has_logits_soft_cap",
+    "bias_type",
+    "has_lse",
+    "has_dropout",
+    "skip_min_seqlen_q",
+    "qscale_type",
+    "has_sink",
+)
+_STR_SIGNATURE_COLS = frozenset({"mode", "dtype"})
+
+# Columns of mha_tuned_*.csv: the full signature (consumed by
+# mha_gen_runtime_json.py), the kernel variant actually benched, then the
+# per-row winner.
+TUNED_CSV_COLS: tuple[str, ...] = (
+    "max_seqlen",
+    *SIGNATURE_COLS,
+    "bench_variant",
+    "best_hdim_q",
+    "best_hdim_v",
+    "best_time_ms",
+    "best_tflops",
+    "best_gbps",
+    "best_kname",
+    "best_tile_name",
+    "best_tile_expr",
+    "status",
+)
+
+# Filename token -> value, per signature field (mirrors mha_count_shape's
+# _BOOL_TOKENS / _BIAS_TOKENS / _QSCALE_TOKENS, which follow CK-tile
+# FmhaFwdPipeline.name).
+_SIG_BOOL_TOKENS: dict[str, dict[str, int]] = {
+    "has_logits_soft_cap": {"nlogits": 0, "logits": 1},
+    "has_lse": {"nlse": 0, "lse": 1},
+    "has_dropout": {"ndropout": 0, "dropout": 1},
+    "skip_min_seqlen_q": {"nskip": 0, "skip": 1},
+    "has_sink": {"nsink": 0, "sink": 1},
+}
+_SIG_BIAS_TOKENS: dict[str, int] = {"nbias": 0, "bias": 1, "alibi": 2}
+_SIG_QSCALE_TOKENS: dict[str, int] = {
+    "nqscale": 0,
+    "pertensor": 1,
+    "blockscale": 2,
+    "kv_blockscale": 3,
+    "mx": 4,
+}
+
+
+def _alt(tokens) -> str:
+    # Longest first so that e.g. `kv_blockscale` wins over `blockscale`.
+    return "|".join(re.escape(t) for t in sorted(tokens, key=len, reverse=True))
+
+
+# (field, regex for one filename token, converter) in filename order.
+_SIG_TOKEN_SPECS: tuple[tuple[str, str, Any], ...] = (
+    ("mode", r"[a-zA-Z0-9]+", str),
+    ("dtype", r"[a-zA-Z0-9]+", str),
+    ("hdim_q", r"hq(\d+)", int),
+    ("hdim_v", r"hv(\d+)", int),
+    ("mask_type", r"mask(\d+)", int),
+    ("nhead_q", r"nh(\d+)", int),
+    ("nhead_k", r"nhk(\d+)", int),
+    (
+        "has_logits_soft_cap",
+        f"({_alt(_SIG_BOOL_TOKENS['has_logits_soft_cap'])})",
+        _SIG_BOOL_TOKENS["has_logits_soft_cap"].__getitem__,
+    ),
+    ("bias_type", f"({_alt(_SIG_BIAS_TOKENS)})", _SIG_BIAS_TOKENS.__getitem__),
+    *(
+        (c, f"({_alt(_SIG_BOOL_TOKENS[c])})", _SIG_BOOL_TOKENS[c].__getitem__)
+        for c in ("has_lse", "has_dropout", "skip_min_seqlen_q")
+    ),
+    ("qscale_type", f"({_alt(_SIG_QSCALE_TOKENS)})", _SIG_QSCALE_TOKENS.__getitem__),
+    (
+        "has_sink",
+        f"({_alt(_SIG_BOOL_TOKENS['has_sink'])})",
+        _SIG_BOOL_TOKENS["has_sink"].__getitem__,
+    ),
+)
+assert tuple(s[0] for s in _SIG_TOKEN_SPECS) == SIGNATURE_COLS
+
+
+def parse_signature(sig: str) -> dict[str, Any]:
+    """Parse a group signature string (the `<sig>` part of
+    `mha_untune_<gid>_<sig>.csv`) into {SIGNATURE_COLS: value}.
+
+    Every field is mandatory and must appear in SIGNATURE_COLS order;
+    missing / reordered / unknown tokens and trailing garbage raise
+    ValueError naming the first offending field and the remaining ones.
+    """
+    rest = sig
+    out: dict[str, Any] = {}
+    for i, (field, frag, conv) in enumerate(_SIG_TOKEN_SPECS):
+        m = re.match(rf"(?:{frag})(?=_|$)", rest)
+        if not m:
+            remaining = [s[0] for s in _SIG_TOKEN_SPECS[i:]]
+            raise ValueError(
+                f"signature {sig!r}: cannot parse field {field!r} at "
+                f"{rest!r} (expected /{frag}/); missing or invalid fields: "
+                f"{remaining}"
+            )
+        token = m.group(1) if m.groups() else m.group(0)
+        out[field] = conv(token)
+        rest = rest[m.end() :]
+        rest = rest.removeprefix("_")
+    if rest:
+        raise ValueError(f"signature {sig!r}: unexpected trailing tokens {rest!r}")
+    return out
+
+
 # CK-tile fmha default binary target.
 DEFAULT_BUILD_TARGET = "tile_example_fmha_fwd"
 
 # Default CMake configure options (mirrors gen_tune_configs.py).
-# NOTE: `-DFMHA_FWD_GEN_OPTDIM=<hdim_q>` is appended per-pair at runtime.
+# NOTE: `-DFMHA_FWD_GEN_OPTDIM=<hdim_q>` and `-DFMHA_FWD_GEN_FILTER=<glob>`
+# (derived from the untune CSV signature, see _gen_filter_from_meta) are
+# appended per-pair at runtime.
 DEFAULT_CMAKE_OPTIONS: list[str] = [
     "-G",
     "Ninja",
@@ -211,8 +335,15 @@ DEFAULT_CMAKE_OPTIONS: list[str] = [
     "-DDL_KERNELS=OFF",
     "-DBUILD_MHA_LIB=OFF",
     "-DFMHA_FWD_GEN_RECEIPT=200",
-    "-DFMHA_FWD_GEN_FILTER=*bf16*_nbias*_nlse*_ndropout*",
 ]
+
+# tile_example_fmha_fwd (CK example runner) never sets
+# fmha_fwd_traits::skip_min_seqlen_q (fmha_fwd_runner.hpp init_traits; the
+# field defaults to false in fmha_fwd.hpp), so it can only dispatch the
+# `_nskip` kernel variant. Groups whose signature has skip_min_seqlen_q=1
+# are therefore built AND benched with the nskip variant and the tuned CSV
+# records bench_variant=nskip. Flip this once the runner can select skip.
+BENCH_SKIP_SUPPORTED = False
 
 # Regex used to parse the perf line printed by tile_example_fmha_fwd, e.g.
 #   ..., 2.897 ms, 37.69 TFlops, 101.68 GB/s
@@ -224,17 +355,11 @@ _PERF_RE = re.compile(
 )
 _KNAME_RE = re.compile(r"(fmha_fwd_[A-Za-z0-9_]+)")
 
-# Untune CSV filename pattern (used to derive gid + suffix for naming the
-# tuned CSV output). The optional `_<trait>...` tail is the full kernel-trait
-# signature written by mha_count_shape.py (nh/nhk + CK pipeline tokens);
-# legacy names ending at `mask<M>` still match.
-_UNTUNE_NAME_RE = re.compile(
-    r"^mha_untune_(?P<gid>\d+)_"
-    r"(?P<mode>[a-zA-Z0-9]+)_"
-    r"(?P<dtype>[a-zA-Z0-9]+)_"
-    r"hq(?P<hq>\d+)_hv(?P<hv>\d+)_"
-    r"mask(?P<mask>\d+)(?P<traits>(?:_[a-zA-Z0-9]+)*)\.csv$"
-)
+# Untune CSV filename pattern: `mha_untune_<gid>_<sig>.csv`, where <sig> is
+# the full group signature written by mha_count_shape.py and parsed by
+# parse_signature(). Legacy 5-field names (ending at `mask<M>`) are rejected
+# by parse_untune_csv().
+_UNTUNE_NAME_RE = re.compile(r"^mha_untune_(?P<gid>\d+)_(?P<sig>.+)\.csv$")
 
 
 # ===========================================================================
@@ -582,87 +707,148 @@ def _require_supported_mode(mode: str, where: str) -> None:
 
 @dataclass
 class UntuneMeta:
-    """Group-level metadata parsed from the untune CSV (filename + first row).
+    """Group-level metadata parsed from an untune CSV.
 
-    All 5 fields together form the "group signature" that pins one row of
-    the CK-tile fmha kernel table (dtype/hdim/mask/mode).
+    The SIGNATURE_COLS fields form the "group signature" that pins exactly
+    one CK-tile fmha kernel variant (mode/dtype/hdim/mask + traits) and the
+    bench shape (nhead_q/nhead_k). They are read from the CSV columns and
+    cross-checked against the filename; there are no CLI overrides.
     """
 
-    gid: int | None  # group id from filename ('0' etc.), maybe None
+    gid: int  # group id from filename
     mode: str  # always 'group' (only group/varlen fwd is supported)
     dtype: str  # 'bf16' / 'fp16'
-    hdim_q: int  # from CSV / filename
+    hdim_q: int
     hdim_v: int
-    mask_type: int  # 0/1/2/3
+    mask_type: int  # 0/1/2 (3 = window_generic is rejected at bench time)
+    nhead_q: int
+    nhead_k: int
+    has_logits_soft_cap: int  # always 0 (supported scope)
+    bias_type: int  # 0 = none, 1 = elementwise, 2 = alibi
+    has_lse: int
+    has_dropout: int  # always 0 (dropout is dropped by mha_count_shape)
+    skip_min_seqlen_q: int  # 1 when the dumped min_seqlen_q != 0
+    qscale_type: int  # always 0 (supported scope)
+    has_sink: int  # always 0 (supported scope)
     input_stem: str  # basename without extension (for output naming)
     input_path: Path
 
+    def signature(self) -> dict[str, Any]:
+        return {c: getattr(self, c) for c in SIGNATURE_COLS}
+
+
+# Signature values mha_tune.py can build + bench. Anything else is outside
+# the supported scope (mha_count_shape.py `group` already drops those
+# records; this guards against hand-edited CSVs).
+_SUPPORTED_SIGNATURE_VALUES: dict[str, tuple[Any, ...]] = {
+    "mode": SUPPORTED_MODES,
+    "has_logits_soft_cap": (0,),
+    "has_dropout": (0,),  # dump has no p_drop; pending future support
+    "qscale_type": (0,),
+    "has_sink": (0,),
+    "bias_type": tuple(BIAS_TYPE_TO_LETTER),
+    "has_lse": (0, 1),
+    "skip_min_seqlen_q": (0, 1),
+}
+
+
+def _sig_value(col: str, raw: Any, where: str) -> Any:
+    s = str(raw).strip()
+    if col in _STR_SIGNATURE_COLS:
+        return s
+    try:
+        return int(s)
+    except ValueError:
+        raise ValueError(f"{where}: column {col}={raw!r} is not an integer") from None
+
 
 def parse_untune_csv(path: Path) -> tuple[UntuneMeta, list[int]]:
-    """Read mha_untune_*.csv and return (meta, max_seqlen_list).
+    """Read mha_untune_<gid>_<sig>.csv and return (meta, max_seqlen_list).
 
-    The CSV must have header:
-        max_seqlen, mode, dtype, hdim_q, hdim_v, mask_type
-    All rows are assumed to share the same 5 group-key fields; we validate
-    that and error out on any mismatch. Only mode=group is accepted.
+    Strict checks (ValueError on failure; no legacy fallback):
+      * the filename matches `mha_untune_<gid>_<sig>.csv` and <sig> holds
+        every SIGNATURE_COLS field (see parse_signature);
+      * the CSV has `max_seqlen` + every SIGNATURE_COLS column;
+      * every row carries the same signature values;
+      * the CSV signature equals the filename signature;
+      * the signature is inside the supported scope (group mode, no
+        dropout / soft-cap / qscale / sink).
     """
+    path = Path(path)
     if not path.is_file():
         raise FileNotFoundError(f"untune csv not found: {path}")
 
+    m = _UNTUNE_NAME_RE.match(path.name)
+    if not m:
+        raise ValueError(
+            f"untune csv filename {path.name!r} does not match "
+            f"mha_untune_<gid>_<signature>.csv; regenerate it with "
+            f"`mha_count_shape.py generate_tune_range`"
+        )
+    gid = int(m.group("gid"))
+    try:
+        name_sig = parse_signature(m.group("sig"))
+    except ValueError as e:
+        raise ValueError(
+            f"untune csv filename {path.name!r}: {e}; legacy 5-field names "
+            f"are no longer supported, re-run `mha_count_shape.py group` + "
+            f"`generate_tune_range`"
+        ) from None
+
     with path.open("r", encoding="utf-8", newline="") as fp:
         reader = csv.DictReader(fp)
+        header = list(reader.fieldnames or [])
         rows = list(reader)
 
+    missing = [c for c in ("max_seqlen", *SIGNATURE_COLS) if c not in header]
+    if missing:
+        raise ValueError(
+            f"untune csv {path} missing required columns: {missing}; "
+            f"re-run `mha_count_shape.py generate_tune_range`"
+        )
     if not rows:
         raise ValueError(f"untune csv is empty (no data rows): {path}")
 
-    required_cols = {"max_seqlen", "mode", "dtype", "hdim_q", "hdim_v", "mask_type"}
-    missing = required_cols - set(rows[0].keys())
-    if missing:
+    csv_sig: dict[str, Any] | None = None
+    for i, r in enumerate(rows, start=2):  # header is line 1
+        where = f"untune csv {path} line {i}"
+        sig = {c: _sig_value(c, r[c], where) for c in SIGNATURE_COLS}
+        if csv_sig is None:
+            csv_sig = sig
+        elif sig != csv_sig:
+            diff = [c for c in SIGNATURE_COLS if sig[c] != csv_sig[c]]
+            raise ValueError(
+                f"{where} has a different group signature than the first "
+                f"row (fields {diff}); refusing to tune a mixed group."
+            )
+    assert csv_sig is not None
+
+    diff = [c for c in SIGNATURE_COLS if csv_sig[c] != name_sig[c]]
+    if diff:
+        detail = ", ".join(
+            f"{c}: filename={name_sig[c]!r} csv={csv_sig[c]!r}" for c in diff
+        )
         raise ValueError(
-            f"untune csv {path} missing required columns: {sorted(missing)}"
+            f"untune csv {path}: filename signature disagrees with the CSV "
+            f"columns ({detail})"
         )
 
-    first = rows[0]
-    mode = first["mode"].strip()
-    _require_supported_mode(mode, f"untune csv {path}")
-    dtype = first["dtype"].strip()
-    hdim_q = int(first["hdim_q"])
-    hdim_v = int(first["hdim_v"])
-    mask_type = int(first["mask_type"])
-
-    # Validate every other row agrees on the group key.
-    for i, r in enumerate(rows[1:], start=2):
-        if (
-            r["mode"].strip() != mode
-            or r["dtype"].strip() != dtype
-            or int(r["hdim_q"]) != hdim_q
-            or int(r["hdim_v"]) != hdim_v
-            or int(r["mask_type"]) != mask_type
-        ):
+    _require_supported_mode(csv_sig["mode"], f"untune csv {path}")
+    for c, allowed in _SUPPORTED_SIGNATURE_VALUES.items():
+        if csv_sig[c] not in allowed:
             raise ValueError(
-                f"untune csv {path} row {i} has a different group key than "
-                f"the first row; refusing to tune a mixed group."
+                f"untune csv {path}: unsupported {c}={csv_sig[c]!r} "
+                f"(supported: {list(allowed)})"
             )
 
-    # Filename-based gid (best-effort).
-    gid: int | None = None
-    m = _UNTUNE_NAME_RE.match(path.name)
-    if m:
-        try:
-            gid = int(m.group("gid"))
-        except ValueError:
-            gid = None
-
-    max_seqlens = [int(r["max_seqlen"]) for r in rows]
+    try:
+        max_seqlens = [int(r["max_seqlen"]) for r in rows]
+    except ValueError as e:
+        raise ValueError(f"untune csv {path}: bad max_seqlen value: {e}") from None
 
     meta = UntuneMeta(
         gid=gid,
-        mode=mode,
-        dtype=dtype,
-        hdim_q=hdim_q,
-        hdim_v=hdim_v,
-        mask_type=mask_type,
+        **csv_sig,
         input_stem=path.stem,
         input_path=path,
     )
@@ -745,40 +931,79 @@ def _tune_config_path(pair_sub_dir: Path, tile: TileSize) -> Path:
     return _tune_configs_dir(pair_sub_dir) / f"{tile.name}.json"
 
 
-def _filters_from_args(
-    args: argparse.Namespace, meta: UntuneMeta
-) -> dict[str, list[str]]:
-    """Assemble the CustomTuneFactory `filters` block from CLI + CSV meta.
+def _bool_filter(v: int) -> list[str]:
+    return ["t" if int(v) else "f"]
 
-    Only added when we know enough runtime info (i.e. build / run cmd). enum
-    cmd (which lacks --lse/--p-drop/--bias) writes a partial payload without
-    `filters`; build will overwrite it with the complete version.
+
+def bench_variant(meta: UntuneMeta) -> str:
+    """Kernel variant actually built and benched for `meta`: 'skip' or 'nskip'.
+
+    Always 'nskip' while BENCH_SKIP_SUPPORTED is False (see its comment).
     """
-    mask_name = _mask_type_to_ck_name(int(meta.mask_type), DEFAULT_MASK_IMPL)
-    _require_supported_mode(meta.mode, "_filters_from_args")
-    bias_letter = getattr(args, "bias", None)
-    bias_name = BIAS_LETTER_TO_CK_NAME.get(bias_letter) if bias_letter else None
+    if meta.skip_min_seqlen_q and BENCH_SKIP_SUPPORTED:
+        return "skip"
+    return "nskip"
 
-    lse = getattr(args, "lse", None)
-    p_drop = getattr(args, "p_drop", None)
 
+def _warn_if_skip_downgraded(meta: UntuneMeta, stage: str) -> None:
+    if meta.skip_min_seqlen_q and bench_variant(meta) == "nskip":
+        print(
+            f"[WARN] {stage}: group needs skip_min_seqlen_q=1 but "
+            f"{DEFAULT_BUILD_TARGET} cannot dispatch skip kernels; "
+            f"building/benching the nskip variant (bench_variant=nskip)",
+            file=sys.stderr,
+        )
+
+
+def _filters_from_meta(meta: UntuneMeta) -> dict[str, list[str]]:
+    """Assemble the CustomTuneFactory `filters` block from the untune CSV
+    signature, so codegen only emits the kernel variant the group needs.
+
+    `skip` follows bench_variant() (nskip while the CK example runner cannot
+    dispatch skip kernels); every other trait mirrors the signature.
+    """
+    _require_supported_mode(meta.mode, "_filters_from_meta")
     filters: dict[str, list[str]] = {
         "mode": [str(meta.mode)],
         "vlayout": ["row"],
     }
+    mask_name = _mask_type_to_ck_name(int(meta.mask_type), DEFAULT_MASK_IMPL)
     if mask_name is not None:
         filters["mask"] = [mask_name]
-    if bias_name is not None:
-        filters["bias"] = [bias_name]
-    if lse is not None:
-        filters["lse"] = ["t" if int(lse) else "f"]
-    if p_drop is not None:
-        filters["dropout"] = ["t" if float(p_drop) > 0.0 else "f"]
-    # These four aren't user-tunable from CLI, but Aiter's varlen/batch path
-    # only wants logits=f / qscale=no; hard-code them to shrink the search.
-    filters["logits"] = ["f"]
+    bias_letter = BIAS_TYPE_TO_LETTER.get(int(meta.bias_type))
+    if bias_letter is None:
+        raise ValueError(f"_filters_from_meta: unsupported bias_type={meta.bias_type}")
+    filters["bias"] = [BIAS_LETTER_TO_CK_NAME[bias_letter]]
+    filters["lse"] = _bool_filter(meta.has_lse)
+    filters["dropout"] = _bool_filter(meta.has_dropout)
+    filters["logits"] = _bool_filter(meta.has_logits_soft_cap)
+    if int(meta.qscale_type) != 0:
+        raise ValueError(
+            f"_filters_from_meta: unsupported qscale_type={meta.qscale_type}"
+        )
     filters["qscale"] = ["no"]
+    filters["skip"] = ["t" if bench_variant(meta) == "skip" else "f"]
+    filters["sink"] = _bool_filter(meta.has_sink)
     return filters
+
+
+# CK-tile FmhaFwdPipeline.name tokens used by the FMHA_FWD_GEN_FILTER glob.
+_GEN_FILTER_BIAS = {0: "nbias", 1: "bias", 2: "alibi"}
+
+
+def _gen_filter_from_meta(meta: UntuneMeta) -> str:
+    """`-DFMHA_FWD_GEN_FILTER=` glob matching the kernel names of `meta`.
+
+    Kernel names look like
+      fmha_fwd_d<H>_<dtype>_<mode>_<tile>_<pipeline>_..._nlogits_nbias_mask_
+      nlse_ndropout_nskip_nqscale_...
+    The glob is a coarse pre-filter (CustomTuneFactory `filters` do the
+    precise selection); it must never exclude the variant we need.
+    """
+    lse = "lse" if meta.has_lse else "nlse"
+    drop = "dropout" if meta.has_dropout else "ndropout"
+    bias = _GEN_FILTER_BIAS[int(meta.bias_type)]
+    return f"*{meta.dtype}*_{bias}*_{lse}*_{drop}*"
 
 
 def _which_hipcc() -> str | None:
@@ -1013,6 +1238,49 @@ def _parse_perf(stdout: str) -> dict[str, Any] | None:
             "line": raw.strip(),
         }
     return last
+
+
+def bench_args_for_meta(
+    meta: UntuneMeta,
+    *,
+    hdim_q_bench: int,
+    hdim_v_bench: int,
+    max_seqlen: int,
+    warmup: int,
+    repeat: int,
+) -> list[str]:
+    """tile_example_fmha_fwd CLI for one max_seqlen row of `meta`'s group.
+
+    Every shape/trait argument (heads, mask, bias, lse, dropout) comes from
+    the untune CSV signature; only the compiled hdim and timing knobs come
+    from the command line.
+    """
+    mask_letter = MASK_TYPE_TO_LETTER.get(int(meta.mask_type))
+    if mask_letter is None:
+        raise ValueError(
+            f"mask_type={meta.mask_type} cannot be mapped to a "
+            f"tile_example_fmha_fwd -mask= value (window_generic needs an "
+            f"explicit y,x window and is not supported by this tuner)."
+        )
+    if int(meta.has_dropout):
+        raise ValueError(
+            "has_dropout=1 groups are not supported (the dump has no p_drop)"
+        )
+    return _build_bench_args(
+        dtype=meta.dtype,
+        hdim_q_bench=hdim_q_bench,
+        hdim_v_bench=hdim_v_bench,
+        nhead_q=meta.nhead_q,
+        nhead_k=meta.nhead_k,
+        max_seqlen=max_seqlen,
+        mask_letter=mask_letter,
+        lse=int(meta.has_lse),
+        p_drop=0.0,
+        bias=BIAS_TYPE_TO_LETTER[int(meta.bias_type)],
+        warmup=warmup,
+        repeat=repeat,
+        mode=meta.mode,
+    )
 
 
 def _build_bench_args(
@@ -1292,18 +1560,9 @@ def cmd_enum(args: argparse.Namespace) -> int:
         # Also drop one stand-alone tune-config JSON per tile, so downstream
         # `build`/`bench` (and manual invocations) can simply set
         # CK_TILE_FMHA_FWD_CUSTOM_TUNE_CONFIG_FILE=<path> without further work.
-        # `enum` doesn't yet know filter-side info (lse/dropout/bias); those
-        # are written as an empty `filters` block and will be overwritten by
-        # `build` stage. `mask` we DO know from the untune csv.
-        enum_filters: dict[str, list[str]] = {
-            "mode": [str(meta.mode)],
-            "vlayout": ["row"],
-            "logits": ["f"],
-            "qscale": ["no"],
-        }
-        mask_name = _mask_type_to_ck_name(int(meta.mask_type), DEFAULT_MASK_IMPL)
-        if mask_name is not None:
-            enum_filters["mask"] = [mask_name]
+        # The filters come from the untune CSV signature, so the enum output
+        # is already complete (build/bench rewrite the same content).
+        enum_filters = _filters_from_meta(meta)
 
         cfg_dir = _tune_configs_dir(pp.sub_dir)
         cfg_dir.mkdir(parents=True, exist_ok=True)
@@ -1465,27 +1724,35 @@ def _build_stage(
     args: argparse.Namespace,
     do_configure: bool,
     do_make: bool,
+    *,
+    meta: UntuneMeta,
 ) -> tuple[int, list[TilePlan]]:
     """Configure and/or build every tile plan.
 
+    `meta` (the untune CSV signature) determines the codegen
+    `-DFMHA_FWD_GEN_FILTER` glob.
+
     Returns (exit_code, successfully_built_plans).
     """
+    _warn_if_skip_downgraded(meta, "build")
     hipcc = _which_hipcc() if do_configure else None
     if do_configure and not hipcc:
         print(
             "[warn] hipcc not in PATH; CMAKE_{C,CXX}_COMPILER unset.", file=sys.stderr
         )
 
-    # Per-pair -DFMHA_FWD_GEN_OPTDIM=<hdim_q>. We keep other --cmake-opt
-    # user overrides as-is; they win over defaults (CMake takes the last
-    # -D<var>=<val>).
+    # Per-pair -DFMHA_FWD_GEN_OPTDIM=<hdim_q> plus the signature-derived
+    # -DFMHA_FWD_GEN_FILTER. We keep other --cmake-opt user overrides as-is;
+    # they win over defaults (CMake takes the last -D<var>=<val>).
+    gen_filter = f"-DFMHA_FWD_GEN_FILTER={_gen_filter_from_meta(meta)}"
     extra_by_pair: dict[tuple[int, int], list[str]] = {}
     for p in plans:
         key = (p.pair.hdim_q, p.pair.hdim_v)
         if key not in extra_by_pair:
-            extra_by_pair[key] = [f"-DFMHA_FWD_GEN_OPTDIM={p.pair.hdim_q}"] + list(
-                args.cmake_opt
-            )
+            extra_by_pair[key] = [
+                f"-DFMHA_FWD_GEN_OPTDIM={p.pair.hdim_q}",
+                gen_filter,
+            ] + list(args.cmake_opt)
 
     ck_root = str(Path(args.ck_root).resolve())
     if do_configure and not os.path.isfile(os.path.join(ck_root, "CMakeLists.txt")):
@@ -1648,7 +1915,7 @@ def cmd_build(args: argparse.Namespace) -> int:
         args.tune_hdim_q,
         args.tune_hdim_v,
         meta.dtype,
-        filters=_filters_from_args(args, meta),
+        filters=_filters_from_meta(meta),
         limit=int(getattr(args, "limit", 0) or 0),
     )
     if not plans:
@@ -1656,7 +1923,7 @@ def cmd_build(args: argparse.Namespace) -> int:
             "[error] no tile candidates enumerated; nothing to build.", file=sys.stderr
         )
         return 1
-    rc, _ok = _build_stage(plans, args, do_configure=True, do_make=True)
+    rc, _ok = _build_stage(plans, args, do_configure=True, do_make=True, meta=meta)
     return rc
 
 
@@ -1679,7 +1946,7 @@ def cmd_bench(args: argparse.Namespace) -> int:
             args.tune_hdim_q,
             args.tune_hdim_v,
             meta.dtype,
-            filters=_filters_from_args(args, meta),
+            filters=_filters_from_meta(meta),
             limit=int(getattr(args, "limit", 0) or 0),
         )
     except FileNotFoundError as e:
@@ -1695,7 +1962,7 @@ def cmd_bench(args: argparse.Namespace) -> int:
             args.tune_hdim_q,
             args.tune_hdim_v,
             meta.dtype,
-            filters=_filters_from_args(args, meta),
+            filters=_filters_from_meta(meta),
             limit=int(getattr(args, "limit", 0) or 0),
         )
     if not plans:
@@ -1717,7 +1984,9 @@ def cmd_bench(args: argparse.Namespace) -> int:
             f"running `build` first.",
             file=sys.stderr,
         )
-        rc, ok_plans = _build_stage(plans, args, do_configure=True, do_make=True)
+        rc, ok_plans = _build_stage(
+            plans, args, do_configure=True, do_make=True, meta=meta
+        )
         if rc != 0:
             return rc
         if not ok_plans:
@@ -1746,13 +2015,13 @@ def cmd_run(args: argparse.Namespace) -> int:
         args.tune_hdim_q,
         args.tune_hdim_v,
         meta.dtype,
-        filters=_filters_from_args(args, meta),
+        filters=_filters_from_meta(meta),
         limit=int(getattr(args, "limit", 0) or 0),
     )
     if not plans:
         print("[error] no tile candidates enumerated.", file=sys.stderr)
         return 1
-    rc, ok_plans = _build_stage(plans, args, do_configure=True, do_make=True)
+    rc, ok_plans = _build_stage(plans, args, do_configure=True, do_make=True, meta=meta)
     if rc != 0:
         return rc
 
@@ -1779,15 +2048,22 @@ def _bench_stage_and_dump(
     Bench must run serially (GPU is exclusive).
     """
     ck_root = str(Path(args.ck_root).resolve())
-    mask_letter = MASK_TYPE_TO_LETTER.get(meta.mask_type)
-    if mask_letter is None:
-        print(
-            f"[error] mask_type={meta.mask_type} cannot be mapped to a "
-            f"tile_example_fmha_fwd -mask= value (window_generic needs "
-            f"explicit y,x window and is not supported by this tuner).",
-            file=sys.stderr,
+    try:
+        # Validate mask / dropout once before touching any binary.
+        bench_args_for_meta(
+            meta,
+            hdim_q_bench=args.tune_hdim_q,
+            hdim_v_bench=args.tune_hdim_v,
+            max_seqlen=1,
+            warmup=args.warmup,
+            repeat=args.repeat,
         )
+    except ValueError as e:
+        print(f"[error] {e}", file=sys.stderr)
         return 1
+    mask_letter = MASK_TYPE_TO_LETTER[int(meta.mask_type)]
+    variant = bench_variant(meta)
+    _warn_if_skip_downgraded(meta, "bench")
 
     # Pre-collect the (binary, plan) pairs so we don't repeatedly stat().
     ready: list[tuple[str, TilePlan]] = []
@@ -1809,20 +2085,13 @@ def _bench_stage_and_dump(
     tuned_rows: list[dict[str, Any]] = []
 
     for row_idx, M in enumerate(max_seqlens):
-        bench_args_list = _build_bench_args(
-            dtype=meta.dtype,
+        bench_args_list = bench_args_for_meta(
+            meta,
             hdim_q_bench=args.tune_hdim_q,
             hdim_v_bench=args.tune_hdim_v,
-            nhead_q=args.nhead_q,
-            nhead_k=args.nhead_k,
             max_seqlen=M,
-            mask_letter=mask_letter,
-            lse=args.lse,
-            p_drop=args.p_drop,
-            bias=args.bias,
             warmup=args.warmup,
             repeat=args.repeat,
-            mode=meta.mode,
         )
         print()
         print(
@@ -1862,11 +2131,8 @@ def _bench_stage_and_dump(
             tuned_rows.append(
                 {
                     "max_seqlen": M,
-                    "mode": meta.mode,
-                    "dtype": meta.dtype,
-                    "hdim_q": meta.hdim_q,
-                    "hdim_v": meta.hdim_v,
-                    "mask_type": meta.mask_type,
+                    **meta.signature(),
+                    "bench_variant": variant,
                     "best_hdim_q": "",
                     "best_hdim_v": "",
                     "best_time_ms": "",
@@ -1907,11 +2173,8 @@ def _bench_stage_and_dump(
         tuned_rows.append(
             {
                 "max_seqlen": M,
-                "mode": meta.mode,
-                "dtype": meta.dtype,
-                "hdim_q": meta.hdim_q,
-                "hdim_v": meta.hdim_v,
-                "mask_type": meta.mask_type,
+                **meta.signature(),
+                "bench_variant": variant,
                 "best_hdim_q": best["pair_hdim_q"],
                 "best_hdim_v": best["pair_hdim_v"],
                 "best_time_ms": f"{best['time_ms']:.4f}",
@@ -1933,23 +2196,7 @@ def _bench_stage_and_dump(
 
     # ---- write tuned csv ----
     out_csv = tuned_csv_path(meta, Path(args.work_dir).resolve())
-    fieldnames = [
-        "max_seqlen",
-        "mode",
-        "dtype",
-        "hdim_q",
-        "hdim_v",
-        "mask_type",
-        "best_hdim_q",
-        "best_hdim_v",
-        "best_time_ms",
-        "best_tflops",
-        "best_gbps",
-        "best_kname",
-        "best_tile_name",
-        "best_tile_expr",
-        "status",
-    ]
+    fieldnames = list(TUNED_CSV_COLS)
     try:
         with out_csv.open("w", newline="", encoding="utf-8") as fp:
             writer = csv.DictWriter(fp, fieldnames=fieldnames)
@@ -1977,11 +2224,11 @@ def _add_common_args(sp: argparse.ArgumentParser) -> None:
         "--input-csv",
         type=Path,
         required=True,
-        help="[all cmds] Path to mha_untune_<gid>_<mode>_<dtype>_hq<HQ>_"
-        "hv<HV>_mask<M>.csv produced by "
-        "`mha_count_shape.py generate_tune_range`. Filename is parsed "
-        "for (mode, dtype, hdim_q, hdim_v, mask_type); each row's "
-        "max_seqlen drives one bench shape.",
+        help="[all cmds] Path to mha_untune_<gid>_<signature>.csv produced "
+        "by `mha_count_shape.py generate_tune_range`. The signature "
+        "(mode, dtype, hdim, mask, nhead_q/k, bias/lse/dropout/skip/"
+        "...) is read from the CSV columns and must match the "
+        "filename; each row's max_seqlen drives one bench shape.",
     )
     sp.add_argument(
         "--work-dir",
@@ -2108,56 +2355,10 @@ def _add_build_args(sp: argparse.ArgumentParser) -> None:
 
 
 def _add_bench_args(sp: argparse.ArgumentParser) -> None:
-    sp.add_argument(
-        "--nhead-q",
-        type=int,
-        default=16,
-        help="[build/bench/run] Number of Q heads. Passed to "
-        "`tile_example_fmha_fwd -h=<n>` at bench time and echoed "
-        "into the tune-config JSON. Should match nhead_q from your "
-        "MHA_FWD dump log (default: %(default)s).",
-    )
-    sp.add_argument(
-        "--nhead-k",
-        type=int,
-        default=2,
-        help="[build/bench/run] Number of K/V heads. Passed to "
-        "`tile_example_fmha_fwd -h_k=<n>` (default: %(default)s). "
-        "For MQA/GQA this differs from --nhead-q (e.g. 16 Q heads "
-        "share 2 KV heads).",
-    )
-    sp.add_argument(
-        "--lse",
-        type=int,
-        choices=[0, 1],
-        default=0,
-        help="[build/bench/run] Whether to compute LSE (log-sum-exp). "
-        "0 = disabled (default), 1 = enabled. Emitted as "
-        "`-lse=<0|1>` at bench time and written into "
-        "`filters.lse=t|f` of the tune-config JSON so codegen only "
-        "builds the matching pipeline variant. Match this to "
-        "has_lse from the dump log.",
-    )
-    sp.add_argument(
-        "--p-drop",
-        type=float,
-        default=0.0,
-        help="[build/bench/run] Dropout probability (default: "
-        "%(default)s = disabled). Emitted as `-p_drop=<float>` at "
-        "bench time; any positive value flips `filters.dropout=t` "
-        "in the tune-config JSON. Match to has_dropout from the "
-        "dump log.",
-    )
-    sp.add_argument(
-        "--bias",
-        default="n",
-        help="[build/bench/run] Bias variant, one of: "
-        "n = no bias (default), "
-        "e = elementwise bias, "
-        "a = ALiBi. Emitted as `-bias=<letter>` at bench time and "
-        "mirrored into `filters.bias` of the tune-config JSON. "
-        "Match to bias_type from the dump log (0=n, 1=e, 2=a).",
-    )
+    # NOTE: there are intentionally no --nhead-q/--nhead-k/--bias/--lse/
+    # --p-drop options: head counts and kernel traits are read from the
+    # untune CSV (columns + filename signature) so they cannot drift from
+    # the dumped workload. Passing them is an argparse error.
     sp.add_argument(
         "--warmup",
         type=int,
@@ -2196,7 +2397,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     _add_common_args(sp_build)
     _add_build_args(sp_build)
-    _add_bench_args(sp_build)  # need --lse/--p-drop/--bias to populate filters
+    _add_bench_args(sp_build)  # build shares the bench parser surface
     sp_build.set_defaults(func=cmd_build)
 
     sp_bench = sub.add_parser(

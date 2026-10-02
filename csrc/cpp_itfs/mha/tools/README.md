@@ -188,8 +188,9 @@ in `example/ck_tile/01_fmha/codegen/ops/fmha_fwd.py`), so they read the same
 as the `best_kname` in the tuned CSV. `mask` stays numeric because CK's
 `_mask`/`_nmask` does not distinguish top-left from bottom-right causal.
 `generate_tune_range` and `mha_tune.py` only swap the filename prefix
-(`mha_group_` -> `mha_untune_` -> `mha_tuned_`) and keep `<sig>`; legacy
-`..._mask<M>.csv` names are still accepted.
+(`mha_group_` -> `mha_untune_` -> `mha_tuned_`) and keep `<sig>`. Legacy
+5-field `..._mask<M>.csv` group / untune files are **rejected**; re-run
+`group` + `generate_tune_range`.
 
 **Supported-scope filter.** Before grouping, records the workflow cannot
 tune are dropped. Each record is checked in this order and counted under
@@ -202,6 +203,7 @@ the first matching reason:
 | `sink`            | `sink_size > 0` or `has_sink != 0`                                |
 | `logits_soft_cap` | `has_logits_soft_cap != 0`                                        |
 | `qscale`          | `qscale_type != 0`                                                |
+| `dropout`         | `has_dropout != 0` (the dump has no `p_drop`; pending support)    |
 
 Records with `min_seqlen_q != 0` are **kept** (they select the
 `skip_min_seqlen_q` kernel variant). The terminal prints
@@ -250,8 +252,6 @@ python mha_tune.py bench \
     --ck-root  /path/to/composable_kernel/ \
     --work-dir ./mha_group_0/ \
     --tune-hdim-q 80 --tune-hdim-v 96 \
-    --nhead-q 16 --nhead-k 16 \
-    --bias n --lse 0 --p-drop 0.0 \
     --warmup 5 --repeat 50 -j 64 -w 32
 ```
 
@@ -261,16 +261,29 @@ to bench-only when everything is already on disk. The pipeline can also
 be run stage by stage (`mha_tune.py enum` -> `mha_tune.py build` ->
 `mha_tune.py bench`) when you want to inspect intermediate artifacts.
 
-### Frequently used options
+### Group signature comes from the untune CSV
 
-Match the shape parameters to the actual configuration of the target
-MHA group so the bench numbers reflect production dispatch:
+There are **no** `--nhead-q / --nhead-k / --bias / --lse / --p-drop`
+options. `nhead_q`, `nhead_k`, `mask_type`, `bias_type`, `has_lse`,
+`skip_min_seqlen_q`, ... are read from the untune CSV: every row must carry
+every signature column, all rows must agree, and the values must equal the
+ones encoded in the filename `<sig>`; otherwise `mha_tune.py` exits with an
+error naming the offending field. The signature drives both the codegen
+filters (CustomTuneFactory `filters` + `-DFMHA_FWD_GEN_FILTER`) and the
+bench CLI (`-h= -h_k= -mask= -bias= -lse=`).
+
+**skip_min_seqlen_q limitation.** `tile_example_fmha_fwd` never sets
+`fmha_fwd_traits::skip_min_seqlen_q`, so it can only dispatch `_nskip`
+kernels. Groups whose signature has `skip` (dumped `min_seqlen_q != 0`)
+are built and benched with the nskip variant as an approximation; a
+`[WARN] ... bench_variant=nskip` is printed and every tuned CSV row
+records `bench_variant` (`skip` / `nskip`).
+
+### Frequently used options
 
 | Option                          | What it controls                                                                 |
 |--------------------------------|-----------------------------------------------------------------------------------|
 | `--tune-hdim-q / --tune-hdim-v` | Compiled `hdim_q` / `hdim_v` (CK requires certain padded values, e.g. 72 -> 80). |
-| `--nhead-q / --nhead-k`         | Head counts passed to the bench binary; also filters codegen variants.           |
-| `--bias / --lse / --p-drop`     | Feature switches; filter codegen pipelines and are passed to the bench.          |
 | `--warmup / --repeat`           | Bench iteration counts per shape.                                                |
 | `-w / --workers`                | Number of tune configs built in parallel.                                        |
 | `-j / --jobs`                   | `cmake --build -j` for a single config.                                          |
@@ -300,9 +313,10 @@ etc.
 [done] per-shape bench json under: <work-dir>/bench
 ```
 
-Each row of `mha_tuned_*.csv` records the winning tile for one
-`max_seqlen` sample plus the achieved metrics and a human-readable
-tile expression that the merger later re-parses.
+Each row of `mha_tuned_*.csv` records the full group signature (same
+columns as the untune CSV), the `bench_variant` actually benched, the
+winning tile for one `max_seqlen` sample plus the achieved metrics and a
+human-readable tile expression that the merger later re-parses.
 
 Repeat Step 3 for every group you want to tune.
 

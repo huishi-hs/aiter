@@ -19,6 +19,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 _THIS_DIR = Path(__file__).resolve().parent
 _REPO_ROOT = _THIS_DIR.parents[1]
@@ -320,7 +321,7 @@ def _run_cmd_group(td, lines):
 
 
 # Causal record as emitted for a GQA hdim-256 vLLM layer (window -1/0).
-_CAUSAL = dict(mask_type=2, window_left=-1, window_right=0)
+_CAUSAL = {"mask_type": 2, "window_left": -1, "window_right": 0}
 
 
 class TestGroupFilter(unittest.TestCase):
@@ -339,11 +340,12 @@ class TestGroupFilter(unittest.TestCase):
 
     def test_drop_reasons(self):
         cases = {
-            "batch": dict(mode="batch", seqlens_q=[256, 256]),
-            "sliding_window": dict(mask_type=2, window_left=128, window_right=0),
+            "batch": {"mode": "batch", "seqlens_q": [256, 256]},
+            "sliding_window": {"mask_type": 2, "window_left": 128, "window_right": 0},
             "sink": dict(sink_size=4, has_sink=1, **_CAUSAL),
-            "logits_soft_cap": dict(has_logits_soft_cap=1),
-            "qscale": dict(qscale_type=1),
+            "logits_soft_cap": {"has_logits_soft_cap": 1},
+            "qscale": {"qscale_type": 1},
+            "dropout": {"has_dropout": 1},
         }
         for reason, kw in cases.items():
             with self.subTest(reason=reason):
@@ -351,9 +353,9 @@ class TestGroupFilter(unittest.TestCase):
 
     def test_sliding_window_variants(self):
         for kw in (
-            dict(mask_type=2, window_left=-1, window_right=64),  # right window
-            dict(mask_type=3, window_left=32, window_right=32),  # generic local
-            dict(mask_type=0, window_left=128, window_right=-1),  # inconsistent
+            {"mask_type": 2, "window_left": -1, "window_right": 64},  # right window
+            {"mask_type": 3, "window_left": 32, "window_right": 32},  # generic local
+            {"mask_type": 0, "window_left": 128, "window_right": -1},  # inconsistent
         ):
             with self.subTest(**kw):
                 self.assertEqual(self._reason(**kw), "sliding_window")
@@ -370,6 +372,7 @@ class TestGroupFilter(unittest.TestCase):
             "sliding_window",
         )
         self.assertEqual(self._reason(has_sink=1, qscale_type=1), "sink")
+        self.assertEqual(self._reason(qscale_type=1, has_dropout=1), "qscale")
 
     def test_cmd_group_mixed_log(self):
         lines = [
@@ -391,6 +394,7 @@ class TestGroupFilter(unittest.TestCase):
             synth.make_dump_line(seqlens_q=[100], has_logits_soft_cap=1),
             synth.make_dump_line(seqlens_q=[100], qscale_type=1),
             synth.make_dump_line(seqlens_q=[200], qscale_type=1),
+            synth.make_dump_line(seqlens_q=[400], has_dropout=1),
         ]
         with tempfile.TemporaryDirectory() as td:
             out_dir, out = _run_cmd_group(td, lines)
@@ -399,8 +403,8 @@ class TestGroupFilter(unittest.TestCase):
             group_csvs = sorted(p.name for p in out_dir.glob("mha_group_*.csv"))
 
         self.assertIn(
-            "kept 3 / dropped 6 (batch=1, sliding_window=1, sink=1, "
-            "logits_soft_cap=1, qscale=2)",
+            "kept 3 / dropped 7 (batch=1, sliding_window=1, sink=1, "
+            "logits_soft_cap=1, qscale=2, dropout=1)",
             out,
         )
         # only group-mode groups; the min_seqlen_q=1 causal record is kept
@@ -428,6 +432,7 @@ class TestGroupFilter(unittest.TestCase):
                 ("sink", "group", "1", "100"),
                 ("logits_soft_cap", "group", "1", "100"),
                 ("qscale", "group", "2", "300"),  # same bucket aggregated
+                ("dropout", "group", "1", "400"),
             ],
         )
 
@@ -464,22 +469,22 @@ _SIG_HQ256 = (
 
 
 def _key(**over):
-    vals = dict(
-        mode="group",
-        dtype="bf16",
-        hdim_q=72,
-        hdim_v=72,
-        mask_type=0,
-        nhead_q=16,
-        nhead_k=16,
-        has_logits_soft_cap=0,
-        bias_type=0,
-        has_lse=0,
-        has_dropout=0,
-        skip_min_seqlen_q=0,
-        qscale_type=0,
-        has_sink=0,
-    )
+    vals = {
+        "mode": "group",
+        "dtype": "bf16",
+        "hdim_q": 72,
+        "hdim_v": 72,
+        "mask_type": 0,
+        "nhead_q": 16,
+        "nhead_k": 16,
+        "has_logits_soft_cap": 0,
+        "bias_type": 0,
+        "has_lse": 0,
+        "has_dropout": 0,
+        "skip_min_seqlen_q": 0,
+        "qscale_type": 0,
+        "has_sink": 0,
+    }
     vals.update(over)
     return tuple(vals[c] for c in mha_count_shape.GROUP_COLS)
 
@@ -513,16 +518,16 @@ class TestGroupSignature(unittest.TestCase):
 
     def test_each_token(self):
         cases = [
-            (dict(nhead_q=32, nhead_k=4), "_nh32_nhk4_"),
-            (dict(has_logits_soft_cap=1), "_logits_"),
-            (dict(bias_type=1), "_bias_"),
-            (dict(bias_type=2), "_alibi_"),
-            (dict(has_lse=1), "_lse_"),
-            (dict(has_dropout=1), "_dropout_"),
-            (dict(skip_min_seqlen_q=1), "_skip_"),
-            (dict(qscale_type=1), "_pertensor_"),
-            (dict(qscale_type=4), "_mx_"),
-            (dict(mask_type=1), "_mask1_"),
+            ({"nhead_q": 32, "nhead_k": 4}, "_nh32_nhk4_"),
+            ({"has_logits_soft_cap": 1}, "_logits_"),
+            ({"bias_type": 1}, "_bias_"),
+            ({"bias_type": 2}, "_alibi_"),
+            ({"has_lse": 1}, "_lse_"),
+            ({"has_dropout": 1}, "_dropout_"),
+            ({"skip_min_seqlen_q": 1}, "_skip_"),
+            ({"qscale_type": 1}, "_pertensor_"),
+            ({"qscale_type": 4}, "_mx_"),
+            ({"mask_type": 1}, "_mask1_"),
         ]
         for over, token in cases:
             with self.subTest(**over):
@@ -569,7 +574,7 @@ class TestGroupSignature(unittest.TestCase):
             synth.make_dump_line(seqlens_q=[1000], nhead_k=2),
             synth.make_dump_line(seqlens_q=[1000], has_lse=1),
             synth.make_dump_line(seqlens_q=[1000], bias_type=2),
-            synth.make_dump_line(seqlens_q=[1000], has_dropout=1),
+            synth.make_dump_line(seqlens_q=[1000], nhead_q=32),
             synth.make_dump_line(seqlens_q=[1000], min_seqlen_q=1),
             synth.make_dump_line(seqlens_q=[512], **base256),
             synth.make_dump_line(seqlens_q=[512], **{**base256, "min_seqlen_q": 0}),
@@ -638,22 +643,24 @@ class TestGroupSignature(unittest.TestCase):
         self.assertEqual(tuned.name, f"mha_tuned_0_{_SIG_HQ256}.csv")
         self.assertTrue(mha_gen_runtime_json._TUNED_NAME_RE.match(tuned.name))
 
-    def test_generate_tune_range_legacy_group_csv(self):
+    def test_generate_tune_range_legacy_group_csv_rejected(self):
         with tempfile.TemporaryDirectory() as td:
             gcsv = Path(td) / "mha_group_3_group_bf16_hq72_hv72_mask0.csv"
             with gcsv.open("w", newline="", encoding="utf-8") as f:
                 w = csv.writer(f)
                 w.writerow([*mha_count_shape.BASE_GROUP_COLS, "count"])
                 w.writerow(["group", "bf16", 72, 72, 0, 1])
-            out = self._gen_range(gcsv)
-            untune = Path(td) / "mha_untune_3_group_bf16_hq72_hv72_mask0.csv"
-            rows = _read_csv(untune)
-            meta, _ = mha_tune.parse_untune_csv(untune)
-        self.assertIn("[WARN]", out)
-        self.assertEqual(
-            list(rows[0].keys()), ["max_seqlen", *mha_count_shape.BASE_GROUP_COLS]
-        )
-        self.assertEqual(meta.gid, 3)
+            args = argparse.Namespace(
+                input_csv=str(gcsv), output="", range=["512:512:1"], singletons=""
+            )
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf), self.assertRaises(SystemExit):
+                mha_count_shape.cmd_generate_tune_range(args)
+            self.assertFalse(
+                (Path(td) / "mha_untune_3_group_bf16_hq72_hv72_mask0.csv").exists()
+            )
+        self.assertIn("missing columns", buf.getvalue())
+        self.assertIn("nhead_q", buf.getvalue())
 
     def test_generate_tune_range_partial_traits_rejected(self):
         with tempfile.TemporaryDirectory() as td:
@@ -677,21 +684,14 @@ class TestTuneModeGuard(unittest.TestCase):
 
     def test_parse_untune_csv_group_ok(self):
         with tempfile.TemporaryDirectory() as td:
-            p = synth.write_untune_csv(
-                Path(td) / "mha_untune_0_group_bf16_hq72_hv72_mask0.csv",
-                [512, 1024],
-            )
+            p = synth.write_untune_csv(Path(td), [512, 1024])
             meta, ms = mha_tune.parse_untune_csv(p)
         self.assertEqual(meta.mode, "group")
         self.assertEqual(ms, [512, 1024])
 
     def test_parse_untune_csv_rejects_batch(self):
         with tempfile.TemporaryDirectory() as td:
-            p = synth.write_untune_csv(
-                Path(td) / "mha_untune_0_batch_bf16_hq72_hv72_mask0.csv",
-                [512],
-                {"mode": "batch"},
-            )
+            p = synth.write_untune_csv(Path(td), [512], {"mode": "batch"})
             with self.assertRaises(ValueError) as cm:
                 mha_tune.parse_untune_csv(p)
         self.assertIn("unsupported mode='batch'", str(cm.exception))
@@ -719,24 +719,428 @@ class TestTuneModeGuard(unittest.TestCase):
             with self.subTest(mode=mode), self.assertRaises(ValueError):
                 self._bench_args(mode)
 
-    def test_filters_from_args_rejects_batch(self):
-        meta = mha_tune.UntuneMeta(
-            gid=0,
-            mode="batch",
-            dtype="bf16",
-            hdim_q=72,
-            hdim_v=72,
-            mask_type=0,
-            input_stem="x",
-            input_path=Path("x.csv"),
-        )
+    def test_filters_from_meta_rejects_batch(self):
+        meta = _meta(mode="batch")
         with self.assertRaises(ValueError):
-            mha_tune._filters_from_args(argparse.Namespace(), meta)
+            mha_tune._filters_from_meta(meta)
         meta.mode = "group"
+        self.assertEqual(mha_tune._filters_from_meta(meta)["mode"], ["group"])
+
+
+def _meta(**over):
+    """UntuneMeta built from synth.signature(**over)."""
+    return mha_tune.UntuneMeta(
+        gid=0,
+        **synth.signature(**over),
+        input_stem="mha_untune_0_x",
+        input_path=Path("mha_untune_0_x.csv"),
+    )
+
+
+# hq256 GQA causal group from the real vLLM log (min_seqlen_q=1 -> skip).
+_HQ256 = {
+    "hdim_q": 256,
+    "hdim_v": 256,
+    "mask_type": 2,
+    "nhead_k": 2,
+    "skip_min_seqlen_q": 1,
+}
+
+
+class TestSignatureConsts(unittest.TestCase):
+    """C6: the three tools agree on the signature columns."""
+
+    def test_same_signature_cols(self):
+        self.assertEqual(mha_tune.SIGNATURE_COLS, mha_count_shape.GROUP_COLS)
         self.assertEqual(
-            mha_tune._filters_from_args(argparse.Namespace(), meta)["mode"],
-            ["group"],
+            mha_gen_runtime_json.SIGNATURE_COLS, mha_count_shape.GROUP_COLS
         )
+        self.assertEqual(tuple(synth.SIGNATURE_DEFAULTS), mha_count_shape.GROUP_COLS)
+        self.assertEqual(
+            tuple(
+                mha_tune.UntuneMeta(
+                    gid=0, **synth.signature(), input_stem="", input_path=Path(".")
+                ).signature()
+            ),
+            mha_count_shape.GROUP_COLS,
+        )
+
+    def test_tuned_fieldnames(self):
+        self.assertEqual(mha_tune.TUNED_CSV_COLS, synth.TUNED_FIELDNAMES)
+
+    def test_synth_name_matches_count_shape(self):
+        for over in ({}, _HQ256, {"bias_type": 2, "has_lse": 1}):
+            sig = synth.signature(**over)
+            with self.subTest(**over):
+                self.assertEqual(
+                    synth.signature_name(sig),
+                    mha_count_shape.group_signature(
+                        tuple(sig[c] for c in mha_count_shape.GROUP_COLS)
+                    ),
+                )
+
+
+class TestParseSignature(unittest.TestCase):
+    """C6: filename signature <-> GROUP_COLS round trip and strictness."""
+
+    def test_round_trip(self):
+        cases = [
+            {},
+            _HQ256,
+            {"nhead_q": 32, "nhead_k": 4, "bias_type": 1, "has_lse": 1},
+            {
+                "has_logits_soft_cap": 1,
+                "has_dropout": 1,
+                "qscale_type": 2,
+                "has_sink": 1,
+            },
+            {"dtype": "fp16", "bias_type": 2, "mask_type": 1},
+        ]
+        for over in cases:
+            sig = synth.signature(**over)
+            with self.subTest(**over):
+                name = mha_count_shape.group_signature(
+                    tuple(sig[c] for c in mha_count_shape.GROUP_COLS)
+                )
+                self.assertEqual(mha_tune.parse_signature(name), sig)
+
+    def test_kv_blockscale_token(self):
+        name = synth.signature_name(synth.signature()).replace(
+            "_nqscale_", "_kv_blockscale_"
+        )
+        self.assertEqual(mha_tune.parse_signature(name)["qscale_type"], 3)
+
+    def test_legacy_and_missing(self):
+        with self.assertRaises(ValueError) as cm:
+            mha_tune.parse_signature("group_bf16_hq72_hv72_mask0")
+        self.assertIn("nhead_q", str(cm.exception))
+        self.assertIn("has_sink", str(cm.exception))  # lists remaining fields
+        full = synth.signature_name(synth.signature())
+        with self.assertRaises(ValueError) as cm:
+            mha_tune.parse_signature(full.replace("_nlse", ""))
+        self.assertIn("has_lse", str(cm.exception))
+
+    def test_unknown_reordered_trailing(self):
+        full = synth.signature_name(synth.signature())
+        bad = [
+            full.replace("_nbias_", "_foo_"),
+            full.replace("nlse_ndropout", "ndropout_nlse"),
+            full + "_extra",
+            full.replace("_nh16_", "_nhx_"),
+        ]
+        for s in bad:
+            with self.subTest(sig=s), self.assertRaises(ValueError):
+                mha_tune.parse_signature(s)
+
+
+class TestParseUntuneCsvSignature(unittest.TestCase):
+    """C6: parse_untune_csv reads + cross-checks the full signature."""
+
+    def _parse(self, td, ms=(512, 1024), meta=None, name=None, **kw):
+        path = Path(td) / name if name else Path(td)
+        p = synth.write_untune_csv(path, list(ms), meta, **kw)
+        return mha_tune.parse_untune_csv(p)
+
+    def _parse_err(self, **kw):
+        """Run _parse in a temp dir and return the ValueError message."""
+        with tempfile.TemporaryDirectory() as td, self.assertRaises(ValueError) as cm:
+            self._parse(td, **kw)
+        return str(cm.exception)
+
+    def test_full_signature_loaded(self):
+        with tempfile.TemporaryDirectory() as td:
+            meta, ms = self._parse(td, meta=_HQ256)
+        self.assertEqual(meta.signature(), synth.signature(**_HQ256))
+        self.assertEqual((meta.nhead_q, meta.nhead_k), (16, 2))
+        self.assertEqual(meta.skip_min_seqlen_q, 1)
+        self.assertEqual(meta.gid, 0)
+        self.assertEqual(ms, [512, 1024])
+
+    def test_legacy_filename_rejected(self):
+        msg = self._parse_err(name="mha_untune_0_group_bf16_hq72_hv72_mask0.csv")
+        self.assertIn("legacy", msg)
+        self.assertIn("nhead_q", msg)
+
+    def test_bad_filename_rejected(self):
+        self._parse_err(name="untune_hq72.csv")
+
+    def test_missing_columns_rejected(self):
+        cols = [
+            c for c in mha_count_shape.GROUP_COLS if c not in ("nhead_k", "has_lse")
+        ]
+        msg = self._parse_err(columns=cols)
+        self.assertIn("missing required columns", msg)
+        self.assertIn("nhead_k", msg)
+        self.assertIn("has_lse", msg)
+
+    def test_legacy_five_columns_rejected(self):
+        msg = self._parse_err(columns=mha_count_shape.BASE_GROUP_COLS)
+        self.assertIn("nhead_q", msg)
+
+    def test_filename_vs_columns_mismatch(self):
+        # filename says nhk2, columns say 16
+        name = synth.untune_csv_name(synth.signature(nhead_k=2))
+        msg = self._parse_err(name=name)
+        self.assertIn("nhead_k", msg)
+        self.assertIn("filename=2", msg)
+        self.assertIn("csv=16", msg)
+
+    def test_mixed_rows_rejected(self):
+        msg = self._parse_err(ms=(512, 1024, 2048), row_over={2: {"has_lse": 1}})
+        self.assertIn("line 4", msg)
+        self.assertIn("has_lse", msg)
+
+    def test_unsupported_traits_rejected(self):
+        for over in (
+            {"has_dropout": 1},
+            {"has_logits_soft_cap": 1},
+            {"qscale_type": 1},
+            {"has_sink": 1},
+        ):
+            with self.subTest(**over):
+                self.assertIn("unsupported", self._parse_err(meta=over))
+
+
+class TestTuneFromSignature(unittest.TestCase):
+    """C6: filters / bench args / tuned csv all come from the signature."""
+
+    def test_filters_follow_meta(self):
+        f = mha_tune._filters_from_meta(_meta(bias_type=2, has_lse=1))
+        self.assertEqual(
+            f,
+            {
+                "mode": ["group"],
+                "vlayout": ["row"],
+                "mask": ["s_no"],
+                "bias": ["alibi"],
+                "lse": ["t"],
+                "dropout": ["f"],
+                "logits": ["f"],
+                "qscale": ["no"],
+                "skip": ["f"],
+                "sink": ["f"],
+            },
+        )
+
+    def test_filters_skip_group_uses_nskip(self):
+        f = mha_tune._filters_from_meta(_meta(**_HQ256))
+        self.assertEqual(f["mask"], ["s_mask"])
+        self.assertEqual(f["skip"], ["f"])
+        self.assertEqual(f["sink"], ["f"])
+        self.assertEqual(mha_tune.bench_variant(_meta(**_HQ256)), "nskip")
+
+    def test_gen_filter_glob(self):
+        self.assertEqual(
+            mha_tune._gen_filter_from_meta(_meta()),
+            "*bf16*_nbias*_nlse*_ndropout*",
+        )
+        self.assertEqual(
+            mha_tune._gen_filter_from_meta(_meta(bias_type=2, has_lse=1)),
+            "*bf16*_alibi*_lse*_ndropout*",
+        )
+        self.assertNotIn(
+            "FMHA_FWD_GEN_FILTER", " ".join(mha_tune.DEFAULT_CMAKE_OPTIONS)
+        )
+
+    def test_gqa_bench_args(self):
+        a = mha_tune.bench_args_for_meta(
+            _meta(**_HQ256),
+            hdim_q_bench=256,
+            hdim_v_bench=256,
+            max_seqlen=2048,
+            warmup=1,
+            repeat=2,
+        )
+        for tok in (
+            "-h=16",
+            "-h_k=2",
+            "-mask=2",
+            "-d=256",
+            "-s=2048",
+            "-s_k=2048",
+            "-bias=n",
+            "-lse=0",
+            "-p_drop=0.0",
+            "-mode=1",
+        ):
+            self.assertIn(tok, a)
+        b = mha_tune.bench_args_for_meta(
+            _meta(bias_type=1, has_lse=1),
+            hdim_q_bench=80,
+            hdim_v_bench=96,
+            max_seqlen=512,
+            warmup=1,
+            repeat=1,
+        )
+        self.assertIn("-bias=e", b)
+        self.assertIn("-lse=1", b)
+        self.assertIn("-h_k=16", b)
+
+    def test_bench_args_reject_dropout_and_window(self):
+        for over in ({"has_dropout": 1}, {"mask_type": 3}):
+            with self.subTest(**over), self.assertRaises(ValueError):
+                mha_tune.bench_args_for_meta(
+                    _meta(**over),
+                    hdim_q_bench=80,
+                    hdim_v_bench=96,
+                    max_seqlen=512,
+                    warmup=1,
+                    repeat=1,
+                )
+
+    def test_old_cli_options_rejected(self):
+        parser = mha_tune.build_parser()
+        base = [
+            "bench",
+            "-i",
+            "x.csv",
+            "--work-dir",
+            "w",
+            "--ck-root",
+            "c",
+            "--tune-hdim-q",
+            "80",
+            "--tune-hdim-v",
+            "96",
+        ]
+        ns = parser.parse_args(base)
+        for attr in ("nhead_q", "nhead_k", "lse", "p_drop", "bias"):
+            self.assertFalse(hasattr(ns, attr), attr)
+        for extra in (
+            ["--nhead-k", "2"],
+            ["--nhead-q", "16"],
+            ["--lse", "1"],
+            ["--p-drop", "0.1"],
+            ["--bias", "n"],
+        ):
+            err = io.StringIO()
+            sub = self.subTest(extra=extra)
+            with sub, contextlib.redirect_stderr(err), self.assertRaises(SystemExit):
+                parser.parse_args(base + extra)
+
+    def _run_bench_stage(self, td, sig_over, max_seqlens=(512, 1024)):
+        td = Path(td)
+        untune = synth.write_untune_csv(td, list(max_seqlens), sig_over)
+        meta, ms = mha_tune.parse_untune_csv(untune)
+        tile = mha_tune.TileSize(*synth.DEFAULT_TILE)
+        pair = mha_tune.PairPlan(
+            hdim_q=256,
+            hdim_v=256,
+            sub_dir=td / "hq256_hv256",
+            tiles_json=td / "hq256_hv256" / "tile_candidates.json",
+            build_root=td / "hq256_hv256",
+        )
+        bdir = pair.build_root / f"build_{tile.name}"
+        binary = Path(mha_tune._binary_path(str(bdir), "tile_example_fmha_fwd"))
+        binary.parent.mkdir(parents=True)
+        binary.write_text("")
+        plan = mha_tune.TilePlan(
+            pair=pair,
+            tile=tile,
+            build_dir=bdir,
+            cfg_json_path=td / "cfg.json",
+            cfg_json_text="{}",
+        )
+        args = argparse.Namespace(
+            ck_root=str(td),
+            work_dir=str(td / "work"),
+            tune_hdim_q=256,
+            tune_hdim_v=256,
+            warmup=1,
+            repeat=1,
+            build_target="tile_example_fmha_fwd",
+            dry_run=False,
+        )
+        calls = []
+
+        def fake_bench(binary, bench_args, ck_root, dry_run):
+            calls.append(list(bench_args))
+            return "ok", {"time_ms": 0.5, "tflops": 10.0, "gbps": 1.0, "kname": "k"}
+
+        err = io.StringIO()
+        with mock.patch.object(
+            mha_tune, "_do_bench", side_effect=fake_bench
+        ), contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+            rc = mha_tune._bench_stage_and_dump([plan], meta, ms, args)
+        tuned = mha_tune.tuned_csv_path(meta, Path(args.work_dir))
+        return rc, calls, err.getvalue(), tuned, _read_csv(tuned)
+
+    def test_bench_stage_skip_group(self):
+        with tempfile.TemporaryDirectory() as td:
+            rc, calls, err, tuned, rows = self._run_bench_stage(td, _HQ256)
+            lc = mha_gen_runtime_json.TunedCsv.load(tuned)
+        self.assertEqual(rc, 0)
+        self.assertEqual(len(calls), 2)
+        for c in calls:
+            self.assertIn("-h_k=2", c)
+            self.assertIn("-mask=2", c)
+        self.assertIn("[WARN] bench", err)
+        self.assertIn("bench_variant=nskip", err)
+        self.assertEqual(list(rows[0].keys()), list(mha_tune.TUNED_CSV_COLS))
+        self.assertEqual({r["bench_variant"] for r in rows}, {"nskip"})
+        self.assertEqual({r["skip_min_seqlen_q"] for r in rows}, {"1"})
+        self.assertEqual({r["nhead_k"] for r in rows}, {"2"})
+        self.assertEqual({r["status"] for r in rows}, {"ok"})
+        self.assertEqual(
+            tuned.name,
+            synth.untune_csv_name(synth.signature(**_HQ256)).replace(
+                "mha_untune_", "mha_tuned_"
+            ),
+        )
+        # mha_gen_runtime_json reads the new columns
+        self.assertEqual(lc.signature, synth.signature(**_HQ256))
+        self.assertEqual(lc.bench_variant, "nskip")
+
+    def test_bench_stage_nskip_group_no_warn(self):
+        with tempfile.TemporaryDirectory() as td:
+            rc, _, err, _, rows = self._run_bench_stage(td, {})
+        self.assertEqual(rc, 0)
+        self.assertNotIn("[WARN]", err)
+        self.assertEqual({r["bench_variant"] for r in rows}, {"nskip"})
+        self.assertEqual({r["skip_min_seqlen_q"] for r in rows}, {"0"})
+
+    def test_build_stage_uses_meta_gen_filter_and_warns(self):
+        args = argparse.Namespace(
+            cmake_opt=[],
+            ck_root="/nonexistent",
+            workers=1,
+            build_target="tile_example_fmha_fwd",
+            jobs=1,
+            no_fresh=False,
+            dry_run=True,
+            stop_on_error=False,
+        )
+        tile = mha_tune.TileSize(*synth.DEFAULT_TILE)
+        pair = mha_tune.PairPlan(256, 256, Path("s"), Path("s/t.json"), Path("s"))
+        plan = mha_tune.TilePlan(pair, tile, Path("s/b"), Path("s/c.json"), "{}")
+        seen = []
+
+        def fake_one(p, hipcc, ck_root, extra, *rest):
+            seen.append(list(extra))
+            return {
+                "tile_name": p.tile.name,
+                "did_configure": False,
+                "did_make": False,
+                "configure_ok": True,
+                "build_ok": True,
+                "log": None,
+            }
+
+        err = io.StringIO()
+        with mock.patch.object(
+            mha_tune, "_configure_and_build_one", side_effect=fake_one
+        ), contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+            rc, ok = mha_tune._build_stage(
+                [plan],
+                args,
+                do_configure=False,
+                do_make=False,
+                meta=_meta(**_HQ256, has_lse=1),
+            )
+        self.assertEqual((rc, len(ok)), (0, 1))
+        self.assertIn("-DFMHA_FWD_GEN_FILTER=*bf16*_nbias*_lse*_ndropout*", seen[0])
+        self.assertIn("-DFMHA_FWD_GEN_OPTDIM=256", seen[0])
+        self.assertIn("[WARN] build", err.getvalue())
 
 
 if __name__ == "__main__":

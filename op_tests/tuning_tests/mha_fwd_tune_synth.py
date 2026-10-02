@@ -58,15 +58,76 @@ _GROUP_FIELD_ORDER = (
 )
 _BATCH_FIELD_ORDER = (*_COMMON_FIELD_ORDER, "seqlen_q", "seqlen_k")
 
-# Columns written by mha_tune.py for a tuned csv (keep in sync with the
-# `fieldnames` list at the end of mha_tune.py's bench stage).
+# Full group signature (same order as mha_count_shape.GROUP_COLS) and its
+# default values (bf16 hdim 72/72, 16/16 heads, no mask, no traits).
+SIGNATURE_DEFAULTS: dict[str, Any] = {
+    "mode": "group",
+    "dtype": "bf16",
+    "hdim_q": 72,
+    "hdim_v": 72,
+    "mask_type": 0,
+    "nhead_q": 16,
+    "nhead_k": 16,
+    "has_logits_soft_cap": 0,
+    "bias_type": 0,
+    "has_lse": 0,
+    "has_dropout": 0,
+    "skip_min_seqlen_q": 0,
+    "qscale_type": 0,
+    "has_sink": 0,
+}
+
+_BOOL_TOKENS = {
+    "has_logits_soft_cap": ("nlogits", "logits"),
+    "has_lse": ("nlse", "lse"),
+    "has_dropout": ("ndropout", "dropout"),
+    "skip_min_seqlen_q": ("nskip", "skip"),
+    "has_sink": ("nsink", "sink"),
+}
+_BIAS_TOKENS = {0: "nbias", 1: "bias", 2: "alibi"}
+_QSCALE_TOKENS = {0: "nqscale", 1: "pertensor", 2: "blockscale"}
+
+
+def signature(**over: Any) -> dict[str, Any]:
+    """SIGNATURE_DEFAULTS with overrides (unknown keys rejected)."""
+    bad = set(over) - set(SIGNATURE_DEFAULTS)
+    if bad:
+        raise KeyError(f"unknown signature fields: {sorted(bad)}")
+    return {**SIGNATURE_DEFAULTS, **over}
+
+
+def signature_name(sig: Mapping[str, Any]) -> str:
+    """Filename signature, e.g. group_bf16_hq72_hv72_mask0_nh16_nhk16_
+    nlogits_nbias_nlse_ndropout_nskip_nqscale_nsink (independent copy of
+    mha_count_shape.group_signature, so the tests cross-check it)."""
+    s = {**SIGNATURE_DEFAULTS, **sig}
+    b = {c: int(s[c]) != 0 for c in _BOOL_TOKENS}
+    return "_".join(
+        [
+            str(s["mode"]),
+            str(s["dtype"]),
+            f"hq{s['hdim_q']}",
+            f"hv{s['hdim_v']}",
+            f"mask{s['mask_type']}",
+            f"nh{s['nhead_q']}",
+            f"nhk{s['nhead_k']}",
+            _BOOL_TOKENS["has_logits_soft_cap"][b["has_logits_soft_cap"]],
+            _BIAS_TOKENS[int(s["bias_type"])],
+            _BOOL_TOKENS["has_lse"][b["has_lse"]],
+            _BOOL_TOKENS["has_dropout"][b["has_dropout"]],
+            _BOOL_TOKENS["skip_min_seqlen_q"][b["skip_min_seqlen_q"]],
+            _QSCALE_TOKENS[int(s["qscale_type"])],
+            _BOOL_TOKENS["has_sink"][b["has_sink"]],
+        ]
+    )
+
+
+# Columns written by mha_tune.py for a tuned csv (keep in sync with
+# mha_tune.TUNED_CSV_COLS; asserted by the tests).
 TUNED_FIELDNAMES = (
     "max_seqlen",
-    "mode",
-    "dtype",
-    "hdim_q",
-    "hdim_v",
-    "mask_type",
+    *SIGNATURE_DEFAULTS,
+    "bench_variant",
     "best_hdim_q",
     "best_hdim_v",
     "best_time_ms",
@@ -180,29 +241,37 @@ def write_dump_log(path: Path, lines: Iterable[str], noise: bool = True) -> Path
     return path
 
 
+def untune_csv_name(sig: Mapping[str, Any], gid: int = 0) -> str:
+    return f"mha_untune_{gid}_{signature_name(sig)}.csv"
+
+
 def write_untune_csv(
     path: Path,
     max_seqlens: Iterable[int],
     meta: Mapping[str, Any] | None = None,
+    columns: Sequence[str] | None = None,
+    row_over: Mapping[int, Mapping[str, Any]] | None = None,
 ) -> Path:
     """Write a synthetic `mha_untune_*.csv` as produced by
-    `mha_count_shape.py generate_tune_range` (one row per max_seqlen)."""
+    `mha_count_shape.py generate_tune_range` (one row per max_seqlen).
+
+    `meta` overrides SIGNATURE_DEFAULTS. If `path` is a directory, the
+    canonical filename for `meta` is generated inside it. `columns` limits
+    the signature columns written (to emulate legacy / broken CSVs);
+    `row_over` maps a 0-based row index to per-row overrides.
+    """
     path = Path(path)
+    base = {**SIGNATURE_DEFAULTS, **(meta or {})}
+    if path.is_dir():
+        path = path / untune_csv_name(base)
     path.parent.mkdir(parents=True, exist_ok=True)
-    base = {
-        "mode": "group",
-        "dtype": "bf16",
-        "hdim_q": 72,
-        "hdim_v": 72,
-        "mask_type": 0,
-    }
-    base.update(meta or {})
-    fieldnames = ["max_seqlen", *base.keys()]
+    cols = list(columns) if columns is not None else list(base.keys())
+    fieldnames = ["max_seqlen", *cols]
     with path.open("w", newline="", encoding="utf-8") as fp:
-        writer = csv.DictWriter(fp, fieldnames=fieldnames)
+        writer = csv.DictWriter(fp, fieldnames=fieldnames, extrasaction="ignore")
         writer.writeheader()
-        for m in max_seqlens:
-            writer.writerow({"max_seqlen": m, **base})
+        for i, m in enumerate(max_seqlens):
+            writer.writerow({"max_seqlen": m, **base, **(row_over or {}).get(i, {})})
     return path
 
 
@@ -218,12 +287,9 @@ def make_tile_expr(
 
 
 def tuned_csv_name(meta: Mapping[str, Any], gid: int = 0) -> str:
-    """Filename following `mha_tuned_<gid>_<mode>_<dtype>_hq<HQ>_hv<HV>_mask<M>.csv`."""
-    return (
-        f"mha_tuned_{gid}_{meta.get('mode', 'group')}_{meta.get('dtype', 'bf16')}_"
-        f"hq{meta.get('hdim_q', 72)}_hv{meta.get('hdim_v', 72)}_"
-        f"mask{meta.get('mask_type', 0)}.csv"
-    )
+    """Filename `mha_tuned_<gid>_<sig>.csv` for the signature in `meta`."""
+    sig = {k: v for k, v in meta.items() if k in SIGNATURE_DEFAULTS}
+    return f"mha_tuned_{gid}_{signature_name(sig)}.csv"
 
 
 def write_tuned_csv(
@@ -245,11 +311,8 @@ def write_tuned_csv(
     path.parent.mkdir(parents=True, exist_ok=True)
 
     base = {
-        "mode": "group",
-        "dtype": "bf16",
-        "hdim_q": 72,
-        "hdim_v": 72,
-        "mask_type": 0,
+        **SIGNATURE_DEFAULTS,
+        "bench_variant": "nskip",
         "best_hdim_q": 80,
         "best_hdim_v": 96,
     }
