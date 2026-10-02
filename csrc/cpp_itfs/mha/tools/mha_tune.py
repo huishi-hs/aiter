@@ -36,6 +36,16 @@ Sub-commands:
              one-shot entry point equivalent to `run`.
     run    : full pipeline in one shot
 
+Build reuse (bench only):
+
+    Every successful tile build writes <build_dir>/.mha_tune_build_stamp.json
+    recording hdim_q/hdim_v, tile, the tune-config JSON (incl. signature
+    filters), cmake args and build target. `bench` reuses an existing binary
+    only when its stamp matches the current run; a missing or different
+    stamp is a hard error (exit 2) -- use a new --work-dir or delete the
+    listed build_<tile> dirs. The stamp does NOT track CK source, compiler
+    or arch changes; clean the work-dir yourself after changing those.
+
 Typical usage:
 
     python mha_tune.py run \\
@@ -1218,6 +1228,76 @@ def _binary_path(build_dir: str, target: str) -> str:
     return os.path.join(build_dir, "bin", target)
 
 
+# ---------------------------------------------------------------------------
+# Build stamp: records the MHA config a build_<tile>/ dir was compiled with,
+# so `bench` can refuse to reuse a binary built for a different signature.
+# Deliberately does NOT track CK source / compiler / arch changes.
+# ---------------------------------------------------------------------------
+
+BUILD_STAMP_SCHEMA = 1
+BUILD_STAMP_FILENAME = ".mha_tune_build_stamp.json"
+
+
+def _stamp_path(build_dir: str | Path) -> Path:
+    return Path(build_dir) / BUILD_STAMP_FILENAME
+
+
+def _build_stamp(
+    plan: "TilePlan",
+    extra_cmake_opts: Sequence[str],
+    build_target: str,
+) -> dict[str, Any]:
+    """Everything that decides the codegen / compiled kernel of one tile."""
+    return {
+        "schema": BUILD_STAMP_SCHEMA,
+        "hdim_q": plan.pair.hdim_q,
+        "hdim_v": plan.pair.hdim_v,
+        "tile": plan.tile.name,
+        "tune_config": json.loads(plan.cfg_json_text),
+        "cmake_args": list(DEFAULT_CMAKE_OPTIONS) + list(extra_cmake_opts),
+        "build_target": build_target,
+    }
+
+
+def _read_stamp(build_dir: str | Path) -> dict[str, Any] | None:
+    """Return the stamp dict, or None when missing / unreadable."""
+    try:
+        data = json.loads(_stamp_path(build_dir).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _write_stamp(build_dir: str | Path, stamp: dict[str, Any]) -> None:
+    """Atomically write the stamp (tmp file + os.replace)."""
+    path = _stamp_path(build_dir)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(json.dumps(stamp, indent=2, sort_keys=True), encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def _remove_stamp(build_dir: str | Path) -> None:
+    try:
+        _stamp_path(build_dir).unlink()
+    except FileNotFoundError:
+        pass
+
+
+def _stamp_diff(old: Any, new: Any, prefix: str = "") -> list[str]:
+    """Dotted key paths whose values differ between two stamps."""
+    if isinstance(old, dict) and isinstance(new, dict):
+        out: list[str] = []
+        for k in sorted(set(old) | set(new), key=str):
+            key = f"{prefix}.{k}" if prefix else str(k)
+            if k not in old or k not in new:
+                out.append(key)
+            else:
+                out.extend(_stamp_diff(old[k], new[k], key))
+        return out
+    return [] if old == new else [prefix or "<root>"]
+
+
 # ===========================================================================
 # 4. Bench (per-tile invocation of tile_example_fmha_fwd)
 # ===========================================================================
@@ -1673,6 +1753,11 @@ def _configure_and_build_one(
         "log": log,
     }
 
+    # Drop any previous stamp first so an interrupted / failed rebuild can
+    # never leave "old binary + valid stamp" behind.
+    if (do_configure or do_make) and not dry_run:
+        _remove_stamp(plan.build_dir)
+
     if do_configure:
         result["did_configure"] = True
         rc = _do_configure(
@@ -1721,8 +1806,65 @@ def _configure_and_build_one(
             _emit(f"  [fail] build rc={rc}")
             result["build_ok"] = False
             return result
+        if not dry_run:
+            _write_stamp(
+                plan.build_dir, _build_stamp(plan, extra_cmake_opts, build_target)
+            )
+            _emit(f"  [stamp] wrote {_stamp_path(plan.build_dir)}")
 
     return result
+
+
+def _extra_cmake_opts_for_pair(
+    pair: PairPlan,
+    meta: UntuneMeta,
+    user_cmake_opts: Sequence[str],
+) -> list[str]:
+    """Per-pair -DFMHA_FWD_GEN_OPTDIM=<hdim_q> plus the signature-derived
+    -DFMHA_FWD_GEN_FILTER. Other --cmake-opt user overrides are kept as-is;
+    they win over defaults (CMake takes the last -D<var>=<val>).
+
+    Shared by the build stage and bench's build-stamp check so both see
+    exactly the same arguments.
+    """
+    return [
+        f"-DFMHA_FWD_GEN_OPTDIM={pair.hdim_q}",
+        f"-DFMHA_FWD_GEN_FILTER={_gen_filter_from_meta(meta)}",
+    ] + list(user_cmake_opts)
+
+
+def _classify_existing_builds(
+    plans: list[TilePlan],
+    meta: UntuneMeta,
+    args: argparse.Namespace,
+) -> tuple[list[TilePlan], list[TilePlan], list[tuple[TilePlan, list[str]]]]:
+    """Split plans into (reusable, to_build, stale).
+
+    - to_build : binary missing -> build normally.
+    - reusable : binary present and its build stamp matches this run.
+    - stale    : binary present but stamp missing / unreadable / different;
+                 the second item lists the differing stamp keys.
+    """
+    reusable: list[TilePlan] = []
+    to_build: list[TilePlan] = []
+    stale: list[tuple[TilePlan, list[str]]] = []
+    for p in plans:
+        if not os.path.isfile(_binary_path(str(p.build_dir), args.build_target)):
+            to_build.append(p)
+            continue
+        new = _build_stamp(
+            p,
+            _extra_cmake_opts_for_pair(p.pair, meta, args.cmake_opt),
+            args.build_target,
+        )
+        old = _read_stamp(p.build_dir)
+        if old is None:
+            stale.append((p, ["<no build stamp found>"]))
+        elif old != new:
+            stale.append((p, _stamp_diff(old, new)))
+        else:
+            reusable.append(p)
+    return reusable, to_build, stale
 
 
 def _build_stage(
@@ -1747,18 +1889,13 @@ def _build_stage(
             "[warn] hipcc not in PATH; CMAKE_{C,CXX}_COMPILER unset.", file=sys.stderr
         )
 
-    # Per-pair -DFMHA_FWD_GEN_OPTDIM=<hdim_q> plus the signature-derived
-    # -DFMHA_FWD_GEN_FILTER. We keep other --cmake-opt user overrides as-is;
-    # they win over defaults (CMake takes the last -D<var>=<val>).
-    gen_filter = f"-DFMHA_FWD_GEN_FILTER={_gen_filter_from_meta(meta)}"
     extra_by_pair: dict[tuple[int, int], list[str]] = {}
     for p in plans:
         key = (p.pair.hdim_q, p.pair.hdim_v)
         if key not in extra_by_pair:
-            extra_by_pair[key] = [
-                f"-DFMHA_FWD_GEN_OPTDIM={p.pair.hdim_q}",
-                gen_filter,
-            ] + list(args.cmake_opt)
+            extra_by_pair[key] = _extra_cmake_opts_for_pair(
+                p.pair, meta, args.cmake_opt
+            )
 
     ck_root = str(Path(args.ck_root).resolve())
     if do_configure and not os.path.isfile(os.path.join(ck_root, "CMakeLists.txt")):
@@ -1976,29 +2113,48 @@ def cmd_bench(args: argparse.Namespace) -> int:
         return 1
 
     # ---- Auto step 2: build ----------------------------------------------
-    # Check whether every plan already has its target binary on disk. If any
-    # are missing, run the full build stage and keep only the plans that
-    # built successfully; otherwise skip to bench directly.
-    missing = [
-        p
-        for p in plans
-        if not os.path.isfile(_binary_path(str(p.build_dir), args.build_target))
-    ]
+    # Reuse a tile binary only when its build stamp matches this run's MHA
+    # config (hdim / tile / tune-config filters / cmake args / target). A
+    # binary with a missing or different stamp is never reused nor rebuilt
+    # in place: bail out and let the user pick a new --work-dir or delete
+    # the stale build dirs. Tiles without a binary are built normally.
+    reusable, missing, stale = _classify_existing_builds(plans, meta, args)
+    if stale:
+        for p, diff in stale:
+            print(
+                f"[error] stale build dir {p.build_dir}: "
+                f"differs in {', '.join(diff)}",
+                file=sys.stderr,
+            )
+        print(
+            f"[error] {len(stale)}/{len(plans)} tile build dir(s) were built "
+            f"with a different MHA config (or before build stamps existed); "
+            f"refusing to reuse them. Use a new --work-dir, or remove the "
+            f"build_<tile> dir(s) listed above and rerun.",
+            file=sys.stderr,
+        )
+        return 2
     if missing:
         print(
             f"[bench] {len(missing)}/{len(plans)} tile binaries missing; "
-            f"running `build` first.",
+            f"running `build` for them first.",
             file=sys.stderr,
         )
         rc, ok_plans = _build_stage(
-            plans, args, do_configure=True, do_make=True, meta=meta
+            missing, args, do_configure=True, do_make=True, meta=meta
         )
         if rc != 0:
             return rc
-        if not ok_plans:
+        keep = {id(p) for p in reusable} | {id(p) for p in ok_plans}
+        plans = [p for p in plans if id(p) in keep]
+        if not plans:
             print("[error] no tiles built successfully; cannot bench.", file=sys.stderr)
             return 1
-        plans = ok_plans
+    elif reusable:
+        print(
+            f"[bench] reusing {len(reusable)} tile binaries (build stamps match).",
+            file=sys.stderr,
+        )
 
     # ---- Step 3: bench ---------------------------------------------------
     return _bench_stage_and_dump(plans, meta, max_seqlens, args)

@@ -315,6 +315,45 @@ See `mha_tune.py --help` and `mha_tune.py <subcmd> --help` for every
 option including `--limit`, `--dry-run`, `--stop-on-error`, mask helpers,
 etc.
 
+### Reusing an existing work-dir (build stamps)
+
+Every successful tile build writes
+`<work-dir>/<hq>_<hv>/build_<tile>/.mha_tune_build_stamp.json`, recording
+what the binary was compiled for:
+
+- `hdim_q` / `hdim_v` and the tile name;
+- the full tune-config JSON, i.e. the tile parameters **and** the
+  signature-derived codegen `filters` (mode / mask / bias / lse / dropout /
+  logits / qscale / sink / skip);
+- the cmake arguments (defaults + `-DFMHA_FWD_GEN_OPTDIM` +
+  `-DFMHA_FWD_GEN_FILTER` + your `--cmake-opt`);
+- `--build-target`.
+
+When `bench` finds a tile binary already on disk it compares that stamp
+with the current run:
+
+- **match** &rarr; the binary is reused, no rebuild;
+- **missing binary** &rarr; that tile is built normally (only the missing
+  tiles, not the whole set);
+- **stamp missing / unreadable / different** &rarr; `bench` prints the
+  differing stamp keys for every affected directory and exits with code
+  `2` **without building or overwriting anything**. Pick a fresh
+  `--work-dir`, or delete the listed `build_<tile>` directories, then
+  rerun:
+
+```bash
+# e.g. after switching from a nlse group to an lse group
+rm -rf ./mha_group_0/hq80_hv96/build_*
+```
+
+`build` and `run` always rebuild (and refresh the stamp), so they are
+unaffected by this check.
+
+> **The stamp only covers MHA dimensions and configuration.** It does
+> *not* track `composable_kernel` source changes, the `hipcc` version or
+> the target arch. If you edit CK or switch toolchain/arch, clean the
+> work-dir (or use a new one) yourself.
+
 ### Intermediate artifacts you can inspect
 
 - `--work-dir/<hq>_<hv>/tile_candidates.json` &mdash; enumerated tiles.
@@ -323,6 +362,8 @@ etc.
   `b<bm0>x<bn0>x<bk0>x<bn1>x<bk1>x<bk0max>_r<...>_w<...>_o<occupancy>`.
 - `--work-dir/<hq>_<hv>/build_<tile>/` &mdash; one cmake build tree per
   tile. Failed configs land here with logs.
+- `--work-dir/<hq>_<hv>/build_<tile>/.mha_tune_build_stamp.json` &mdash;
+  the config this tile was built with (see above).
 - `--work-dir/bench/` &mdash; per-shape bench JSON produced by the last
   stage.
 
@@ -447,6 +488,11 @@ when you exercise those paths so the matrix can be updated.
   `bench` now auto-runs `enum` and `build` when their products are
   missing. If the message still shows up, verify you are on the latest
   `mha_tune.py`.
+- **`bench` exits with `[error] stale build dir ...`.** The `build_<tile>`
+  directories in that `--work-dir` were produced by a different group
+  signature / `--cmake-opt` / `--build-target`, or predate build stamps.
+  Reuse is refused on purpose: delete those directories or point
+  `--work-dir` somewhere new. See "Reusing an existing work-dir".
 - **All configs fail to `cmake configure` / build.** Confirm
   `--ck-root` points at a CK checkout that carries the custom-tuning
   factory (`_build_custom_tune_factory`) and the `kOccupancy_` traits

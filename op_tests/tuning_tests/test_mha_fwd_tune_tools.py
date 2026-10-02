@@ -1260,5 +1260,343 @@ class TestTuneFromSignature(unittest.TestCase):
         self.assertIn("[WARN] build", err.getvalue())
 
 
+class TestBuildStamp(unittest.TestCase):
+    """C3 / R4: `bench` reuses a build dir only when its stamp matches.
+
+    The stamp covers MHA dimensions + configuration only (no CK source,
+    compiler or arch); a mismatch is a hard error, never an auto-rebuild.
+    """
+
+    TARGET = "tile_example_fmha_fwd"
+
+    # -- fixtures ---------------------------------------------------------
+    def _args(self, td, **over):
+        ns = argparse.Namespace(
+            input_csv="",
+            work_dir=str(Path(td) / "work"),
+            ck_root=str(td),
+            tune_hdim_q=80,
+            tune_hdim_v=96,
+            build_target=self.TARGET,
+            cmake_opt=[],
+            jobs=1,
+            workers=1,
+            no_fresh=False,
+            dry_run=False,
+            stop_on_error=False,
+            warmup=1,
+            repeat=1,
+            limit=0,
+            occupancy=None,
+            allow_mfma_16=True,
+        )
+        for k, v in over.items():
+            setattr(ns, k, v)
+        return ns
+
+    def _untune(self, base, sig_over=None, sub=""):
+        """Write an untune CSV under `base`/`sub` and parse it."""
+        d = Path(base) / sub if sub else Path(base)
+        d.mkdir(parents=True, exist_ok=True)
+        return mha_tune.parse_untune_csv(synth.write_untune_csv(d, [512], sig_over))
+
+    def _plans(self, td, meta, tiles=(synth.DEFAULT_TILE, synth.ALT_TILE)):
+        """TilePlans with their tune-config JSON written for `meta`."""
+        root = Path(td) / "work" / "hq80_hv96"
+        pair = mha_tune.PairPlan(
+            hdim_q=80,
+            hdim_v=96,
+            sub_dir=root,
+            tiles_json=root / "tile_candidates.json",
+            build_root=root,
+        )
+        return mha_tune._tile_plans_for(
+            pair,
+            [mha_tune.TileSize(*t) for t in tiles],
+            meta.dtype,
+            filters=mha_tune._filters_from_meta(meta),
+        )
+
+    def _touch_binary(self, plan):
+        b = Path(mha_tune._binary_path(str(plan.build_dir), self.TARGET))
+        b.parent.mkdir(parents=True, exist_ok=True)
+        b.write_text("")
+        return b
+
+    def _stamp_for(self, plan, meta, args):
+        return mha_tune._build_stamp(
+            plan,
+            mha_tune._extra_cmake_opts_for_pair(plan.pair, meta, args.cmake_opt),
+            args.build_target,
+        )
+
+    def _pretend_built(self, plans, meta, args):
+        """Binary + matching stamp, as a successful build would leave it."""
+        for p in plans:
+            self._touch_binary(p)
+            mha_tune._write_stamp(p.build_dir, self._stamp_for(p, meta, args))
+
+    def _classify(self, td, sig_over=None, built_sig_over=None, **args_over):
+        """Build with `built_sig_over`, then classify against `sig_over`."""
+        td = Path(td)
+        args = self._args(td, **args_over)
+        built_meta, _ = self._untune(td, built_sig_over, sub="built")
+        self._pretend_built(self._plans(td, built_meta), built_meta, args)
+        meta, _ = self._untune(td, sig_over, sub="now")
+        plans = self._plans(td, meta)
+        return mha_tune._classify_existing_builds(plans, meta, args), plans
+
+    # -- classification ---------------------------------------------------
+    def test_missing_binary_is_built(self):
+        with tempfile.TemporaryDirectory() as td:
+            meta, _ = self._untune(td)
+            plans = self._plans(td, meta)
+            reusable, missing, stale = mha_tune._classify_existing_builds(
+                plans, meta, self._args(td)
+            )
+        self.assertEqual((reusable, missing, stale), ([], plans, []))
+
+    def test_matching_stamp_is_reused(self):
+        with tempfile.TemporaryDirectory() as td:
+            (reusable, missing, stale), plans = self._classify(td)
+        self.assertEqual(len(reusable), len(plans))
+        self.assertEqual((missing, stale), ([], []))
+
+    def test_stamp_missing_is_stale(self):
+        """A build dir from before C3 carries a binary but no stamp."""
+        with tempfile.TemporaryDirectory() as td:
+            meta, _ = self._untune(td)
+            plans = self._plans(td, meta)
+            for p in plans:
+                self._touch_binary(p)
+            reusable, missing, stale = mha_tune._classify_existing_builds(
+                plans, meta, self._args(td)
+            )
+        self.assertEqual((reusable, missing), ([], []))
+        self.assertEqual(
+            [d for _, d in stale], [["<no build stamp found>"]] * len(plans)
+        )
+
+    def test_corrupt_or_foreign_stamp_is_stale(self):
+        for payload in ("not json at all", "[1, 2, 3]"):
+            with self.subTest(payload=payload), tempfile.TemporaryDirectory() as td:
+                args = self._args(td)
+                meta, _ = self._untune(td)
+                plans = self._plans(td, meta)
+                self._pretend_built(plans, meta, args)
+                mha_tune._stamp_path(plans[0].build_dir).write_text(payload)
+                reusable, missing, stale = mha_tune._classify_existing_builds(
+                    plans, meta, args
+                )
+                self.assertEqual(missing, [])
+                self.assertEqual(len(reusable), len(plans) - 1)
+                self.assertEqual([d for _, d in stale], [["<no build stamp found>"]])
+
+    def test_schema_bump_is_stale(self):
+        with tempfile.TemporaryDirectory() as td:
+            args = self._args(td)
+            meta, _ = self._untune(td)
+            plans = self._plans(td, meta)
+            self._pretend_built(plans, meta, args)
+            old = self._stamp_for(plans[0], meta, args)
+            old["schema"] = mha_tune.BUILD_STAMP_SCHEMA + 1
+            mha_tune._write_stamp(plans[0].build_dir, old)
+            _, missing, stale = mha_tune._classify_existing_builds(plans, meta, args)
+        self.assertEqual(missing, [])
+        self.assertEqual([d for _, d in stale], [["schema"]])
+
+    def test_lse_switch_is_stale(self):
+        """Same work-dir, same hdim, but the group signature flipped lse."""
+        with tempfile.TemporaryDirectory() as td:
+            (reusable, missing, stale), plans = self._classify(
+                td, sig_over={"has_lse": 1}, built_sig_over={"has_lse": 0}
+            )
+        self.assertEqual((reusable, missing), ([], []))
+        self.assertEqual(len(stale), len(plans))
+        for _, diff in stale:
+            self.assertIn("tune_config.filters.lse", diff)
+            self.assertIn("cmake_args", diff)
+
+    def test_mask_switch_is_stale(self):
+        with tempfile.TemporaryDirectory() as td:
+            (_, _, stale), plans = self._classify(
+                td, sig_over={"mask_type": 2}, built_sig_over={"mask_type": 0}
+            )
+        self.assertEqual(len(stale), len(plans))
+        for _, diff in stale:
+            self.assertIn("tune_config.filters.mask", diff)
+
+    def test_nhead_change_is_reused(self):
+        """nhead only affects the bench CLI, not the compiled kernel."""
+        with tempfile.TemporaryDirectory() as td:
+            (reusable, missing, stale), plans = self._classify(
+                td, sig_over={"nhead_k": 2}, built_sig_over={"nhead_k": 16}
+            )
+        self.assertEqual(len(reusable), len(plans))
+        self.assertEqual((missing, stale), ([], []))
+
+    def test_cmake_opt_change_is_stale(self):
+        with tempfile.TemporaryDirectory() as td:
+            td = Path(td)
+            meta, _ = self._untune(td)
+            plans = self._plans(td, meta)
+            self._pretend_built(plans, meta, self._args(td))
+            args = self._args(td, cmake_opt=["-DCMAKE_HIP_ARCHITECTURES=gfx950"])
+            _, missing, stale = mha_tune._classify_existing_builds(plans, meta, args)
+        self.assertEqual(missing, [])
+        self.assertEqual([d for _, d in stale], [["cmake_args"]] * len(plans))
+
+    def test_stamp_diff_reports_nested_keys(self):
+        self.assertEqual(mha_tune._stamp_diff({"a": 1}, {"a": 1}), [])
+        self.assertEqual(
+            mha_tune._stamp_diff({"a": {"b": 1, "c": 2}}, {"a": {"b": 9, "c": 2}}),
+            ["a.b"],
+        )
+        self.assertEqual(mha_tune._stamp_diff({"a": 1}, {"b": 1}), ["a", "b"])
+
+    # -- stamp writing ----------------------------------------------------
+    def _build_one(self, plan, extra, make_rc=0, dry_run=False):
+        with mock.patch.object(mha_tune, "_do_make", return_value=make_rc):
+            return mha_tune._configure_and_build_one(
+                plan,
+                None,
+                "/ck",
+                extra,
+                False,  # do_configure
+                True,  # do_make
+                self.TARGET,
+                1,
+                True,
+                dry_run,
+                True,  # buffered
+            )
+
+    def test_successful_make_writes_stamp(self):
+        with tempfile.TemporaryDirectory() as td:
+            args = self._args(td)
+            meta, _ = self._untune(td)
+            plan = self._plans(td, meta)[0]
+            extra = mha_tune._extra_cmake_opts_for_pair(plan.pair, meta, args.cmake_opt)
+            res = self._build_one(plan, extra)
+            stamp = mha_tune._read_stamp(plan.build_dir)
+        self.assertTrue(res["build_ok"])
+        self.assertEqual(stamp, self._stamp_for(plan, meta, args))
+        self.assertEqual(stamp["schema"], mha_tune.BUILD_STAMP_SCHEMA)
+        self.assertEqual((stamp["hdim_q"], stamp["hdim_v"]), (80, 96))
+        self.assertEqual(stamp["tile"], plan.tile.name)
+        self.assertEqual(stamp["build_target"], self.TARGET)
+        self.assertEqual(stamp["tune_config"]["filters"]["lse"], ["f"])
+        for opt in (*mha_tune.DEFAULT_CMAKE_OPTIONS, *extra):
+            self.assertIn(opt, stamp["cmake_args"])
+
+    def test_failed_make_drops_old_stamp(self):
+        with tempfile.TemporaryDirectory() as td:
+            args = self._args(td)
+            meta, _ = self._untune(td)
+            plan = self._plans(td, meta)[0]
+            self._pretend_built([plan], meta, args)
+            res = self._build_one(plan, [], make_rc=1)
+            self.assertFalse(res["build_ok"])
+            self.assertIsNone(mha_tune._read_stamp(plan.build_dir))
+            self.assertFalse(mha_tune._stamp_path(plan.build_dir).exists())
+
+    def test_dry_run_does_not_touch_stamp(self):
+        with tempfile.TemporaryDirectory() as td:
+            args = self._args(td)
+            meta, _ = self._untune(td)
+            plan = self._plans(td, meta)[0]
+            self._pretend_built([plan], meta, args)
+            before = mha_tune._read_stamp(plan.build_dir)
+            self._build_one(plan, [], dry_run=True)
+            self.assertEqual(mha_tune._read_stamp(plan.build_dir), before)
+
+    # -- cmd_bench integration -------------------------------------------
+    def _run_cmd_bench(self, td, plans, meta, args):
+        in_dir = Path(td) / "in"
+        in_dir.mkdir(parents=True, exist_ok=True)
+        args.input_csv = str(synth.write_untune_csv(in_dir, [512], meta.signature()))
+        built = []
+        benched = []
+
+        def fake_build_stage(ps, a, do_configure, do_make, *, meta):
+            built.extend(ps)
+            for p in ps:
+                self._touch_binary(p)
+            return 0, list(ps)
+
+        def fake_bench(ps, m, ms, a):
+            benched.extend(ps)
+            return 0
+
+        err = io.StringIO()
+        with mock.patch.object(
+            mha_tune, "_load_pair_plans_from_disk", return_value=plans
+        ), mock.patch.object(
+            mha_tune, "_build_stage", side_effect=fake_build_stage
+        ), mock.patch.object(
+            mha_tune, "_bench_stage_and_dump", side_effect=fake_bench
+        ), contextlib.redirect_stdout(
+            io.StringIO()
+        ), contextlib.redirect_stderr(
+            err
+        ):
+            rc = mha_tune.cmd_bench(args)
+        return rc, built, benched, err.getvalue()
+
+    def test_cmd_bench_reuses_matching_builds(self):
+        with tempfile.TemporaryDirectory() as td:
+            args = self._args(td)
+            meta, _ = self._untune(td)
+            plans = self._plans(td, meta)
+            self._pretend_built(plans, meta, args)
+            rc, built, benched, err = self._run_cmd_bench(td, plans, meta, args)
+        self.assertEqual(rc, 0)
+        self.assertEqual(built, [])
+        self.assertEqual(benched, plans)
+        self.assertIn("reusing 2 tile binaries", err)
+
+    def test_cmd_bench_builds_only_missing_tiles(self):
+        with tempfile.TemporaryDirectory() as td:
+            args = self._args(td)
+            meta, _ = self._untune(td)
+            plans = self._plans(td, meta)
+            self._pretend_built(plans[:1], meta, args)
+            rc, built, benched, err = self._run_cmd_bench(td, plans, meta, args)
+        self.assertEqual(rc, 0)
+        self.assertEqual(built, plans[1:])
+        self.assertEqual(benched, plans)
+        self.assertIn("1/2 tile binaries missing", err)
+
+    def test_cmd_bench_rejects_stale_without_building(self):
+        with tempfile.TemporaryDirectory() as td:
+            td = Path(td)
+            args = self._args(td)
+            built_meta, _ = self._untune(td, {"has_lse": 0}, sub="built")
+            self._pretend_built(self._plans(td, built_meta), built_meta, args)
+            meta, _ = self._untune(td, {"has_lse": 1}, sub="now")
+            plans = self._plans(td, meta)
+            rc, built, benched, err = self._run_cmd_bench(td, plans, meta, args)
+        self.assertEqual(rc, 2)
+        self.assertEqual((built, benched), ([], []))
+        self.assertIn("stale build dir", err)
+        self.assertIn("tune_config.filters.lse", err)
+        self.assertIn("2/2 tile build dir(s)", err)
+        self.assertIn("--work-dir", err)
+
+    def test_cmd_bench_rejects_when_only_one_tile_is_stale(self):
+        with tempfile.TemporaryDirectory() as td:
+            args = self._args(td)
+            meta, _ = self._untune(td)
+            plans = self._plans(td, meta)
+            self._pretend_built(plans, meta, args)
+            mha_tune._remove_stamp(plans[1].build_dir)
+            rc, built, benched, err = self._run_cmd_bench(td, plans, meta, args)
+        self.assertEqual(rc, 2)
+        self.assertEqual((built, benched), ([], []))
+        self.assertIn("1/2 tile build dir(s)", err)
+        self.assertIn(str(plans[1].build_dir), err)
+        self.assertNotIn(str(plans[0].build_dir), err)
+
+
 if __name__ == "__main__":
     unittest.main()
