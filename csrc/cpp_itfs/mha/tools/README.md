@@ -396,7 +396,13 @@ python mha_gen_runtime_json.py \
 
 The merger:
 
-1. Groups tuned rows per `(dtype, compiled_hdim_q, compiled_hdim_v)`.
+1. Groups tuned rows per `(dtype, compiled_hdim_q, compiled_hdim_v)`, i.e.
+   per bucket CK looks tiles up in, and **rejects** a bucket fed by CSVs
+   that disagree on any other signature column (`mode`, raw `hdim_q/v`,
+   `mask_type`, `nhead_q/k`, `bias_type`, `has_lse`, `has_dropout`,
+   `has_logits_soft_cap`, `skip_min_seqlen_q`, `qscale_type`, `has_sink`,
+   `bench_variant`) or that tunes one `max_seqlen` twice. See
+   "Why conflicting CSVs are rejected" below.
 2. Sorts by `max_seqlen`, computes integer-midpoint boundaries
    (`(M_i + M_{i+1} + 1) // 2`, rounded up so each sample stays inside
    its own half-open interval `[low, high)`), folds
@@ -424,6 +430,33 @@ rest):
 
 Unknown fields in the JSON are ignored by CK, so keeping the annotated
 (non-compact) copy around for auditing is safe.
+
+### Why conflicting CSVs are rejected
+
+A bucket is keyed by `(dtype, compiled hdim_q, compiled hdim_v)` only,
+and the tile inside a bucket is chosen at runtime by `cpp_constraint`,
+which can talk about `max_seqlen_q` and nothing else. Two groups that
+compile to the same bucket but differ in, say, `mask_type` (no-mask
+tuned at 1024, causal tuned at 4096) or in the raw head dim (72/72 and
+80/96 both compile to 80/96) are therefore indistinguishable at
+dispatch time, and silently mixing their tiles would hand each group
+the other group's tile. The merger prints the differing columns plus
+the offending files and exits with status 2:
+
+```
+[error] bucket dtype=bf16 hdim=(80,96) is fed by 2 incompatible tuned csvs (differing in: mask_type)
+  mask_type=0 : mha_tuned_0_group_bf16_hq72_hv72_mask0_..._nskip_nqscale_nsink.csv
+  mask_type=2 : mha_tuned_1_group_bf16_hq80_hv96_mask2_..._nskip_nqscale_nsink.csv
+Tiles of one bucket are selected at runtime by max_seqlen_q only, so these cannot be merged. Emit one JSON per signature.
+```
+
+Likewise, one `max_seqlen` must be tuned exactly once: shapes sharing
+the full signature belong to a single group (that is what step 2 does),
+so picking a winner between two results would be arbitrary.
+
+Buckets, `dtypes` and `meta.sources` are emitted in sorted order, so the
+output does not depend on the order of `--in`: two runs over the same
+set of CSVs differ only in `meta.generated_at`.
 
 ---
 
@@ -493,6 +526,19 @@ when you exercise those paths so the matrix can be updated.
   signature / `--cmake-opt` / `--build-target`, or predate build stamps.
   Reuse is refused on purpose: delete those directories or point
   `--work-dir` somewhere new. See "Reusing an existing work-dir".
+- **`mha_gen_runtime_json.py` exits with `[error] bucket ... incompatible
+  tuned csvs`.** Two tuned CSVs compile to the same
+  `(dtype, hdim_q, hdim_v)` bucket but describe different kernels. Emit
+  one JSON per signature (one deployment JSON can only serve one of
+  them), or re-tune so that the conflicting groups collapse into one.
+  See "Why conflicting CSVs are rejected".
+- **`mha_gen_runtime_json.py` exits with `[error] ... same max_seqlen from
+  several tuned csvs` / `duplicate max_seqlen`.** The same shape was
+  tuned twice. Keep one of the CSVs, or re-run step 2 so those rows end
+  up in a single group and get tuned together.
+- **`mha_gen_runtime_json.py` exits with `[error] ... missing required
+  columns`.** The tuned CSV predates the full signature columns; re-run
+  `mha_tune.py bench` with the current tooling to regenerate it.
 - **All configs fail to `cmake configure` / build.** Confirm
   `--ck-root` points at a CK checkout that carries the custom-tuning
   factory (`_build_custom_tune_factory`) and the `kOccupancy_` traits

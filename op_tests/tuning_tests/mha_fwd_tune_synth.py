@@ -297,6 +297,7 @@ def write_tuned_csv(
     meta: Mapping[str, Any],
     rows: Iterable[Mapping[str, Any]],
     extra_fieldnames: Sequence[str] = (),
+    drop_columns: Iterable[str] = (),
 ) -> Path:
     """Write a synthetic tuned csv.
 
@@ -304,6 +305,7 @@ def write_tuned_csv(
     best_hdim_q, best_hdim_v, plus any extra columns). Each entry of `rows`
     needs at least `max_seqlen`; `tile` (19 ints) and `status` are optional.
     If `path` is a directory, a canonical filename is generated inside it.
+    `drop_columns` omits columns from the header, to emulate legacy csvs.
     """
     path = Path(path)
     if path.is_dir():
@@ -317,7 +319,8 @@ def write_tuned_csv(
         "best_hdim_v": 96,
     }
     base.update(meta)
-    fieldnames = list(TUNED_FIELDNAMES) + [
+    dropped = set(drop_columns)
+    fieldnames = [f for f in TUNED_FIELDNAMES if f not in dropped] + [
         f for f in extra_fieldnames if f not in TUNED_FIELDNAMES
     ]
 

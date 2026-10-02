@@ -124,6 +124,194 @@ class TestRowIntervals(unittest.TestCase):
         self.assertEqual([t["_max_seqlen_samples"] for t in tiles], [[512], [513]])
 
 
+def _write_tuned(
+    d,
+    meta=None,
+    max_seqlens=(1024,),
+    tile=synth.DEFAULT_TILE,
+    gid=0,
+    **kw,
+):
+    """Tuned csv under the canonical `mha_tuned_<gid>_<signature>.csv` name
+    (so the loader does not warn about the filename shape)."""
+    meta = dict(meta or {})
+    rows = [{"max_seqlen": m, "tile": tile} for m in max_seqlens]
+    path = Path(d) / synth.tuned_csv_name({**synth.SIGNATURE_DEFAULTS, **meta}, gid)
+    return synth.write_tuned_csv(path, meta, rows, **kw)
+
+
+def _merge(*paths):
+    return mha_gen_runtime_json.build_merged_payload(
+        list(paths),
+        target="gfx942",
+        schema_version=2,
+        constraint_var="a.max_seqlen_q",
+    )
+
+
+class TestMergeConflicts(unittest.TestCase):
+    """C2: one bucket may only be fed by csvs sharing the kernel signature."""
+
+    def _merge_error(self, *paths):
+        with self.assertRaises(ValueError) as cm:
+            _merge(*paths)
+        return str(cm.exception)
+
+    def test_no_mask_vs_causal(self):
+        with tempfile.TemporaryDirectory() as td:
+            a = _write_tuned(td, {"mask_type": 0}, (1024,))
+            b = _write_tuned(td, {"mask_type": 2}, (4096,))
+            msg = self._merge_error(a, b)
+        self.assertIn("dtype=bf16 hdim=(80,96)", msg)
+        self.assertIn("2 incompatible tuned csvs", msg)
+        self.assertIn("differing in: mask_type", msg)
+        self.assertIn("mask_type=0", msg)
+        self.assertIn("mask_type=2", msg)
+        self.assertIn(a.name, msg)
+        self.assertIn(b.name, msg)
+
+    def test_report_is_order_independent(self):
+        with tempfile.TemporaryDirectory() as td:
+            a = _write_tuned(td, {"mask_type": 0}, (1024,))
+            b = _write_tuned(td, {"mask_type": 2}, (4096,))
+            self.assertEqual(self._merge_error(a, b), self._merge_error(b, a))
+
+    def test_different_raw_hdim_same_compiled_bucket(self):
+        with tempfile.TemporaryDirectory() as td:
+            a = _write_tuned(td, {"hdim_q": 72, "hdim_v": 72}, (1024,))
+            b = _write_tuned(td, {"hdim_q": 80, "hdim_v": 96}, (4096,))
+            msg = self._merge_error(a, b)
+        self.assertIn("differing in: hdim_q, hdim_v", msg)
+
+    def test_gqa_vs_mha(self):
+        with tempfile.TemporaryDirectory() as td:
+            a = _write_tuned(td, {"nhead_k": 16}, (1024,))
+            b = _write_tuned(td, {"nhead_k": 2}, (4096,))
+            msg = self._merge_error(a, b)
+        self.assertIn("differing in: nhead_k", msg)
+        self.assertIn("nhead_k=2", msg)
+        self.assertIn("nhead_k=16", msg)
+
+    def test_every_conflict_column_is_detected(self):
+        alt = {
+            "mode": "batch",
+            "hdim_q": 80,
+            "hdim_v": 96,
+            "mask_type": 2,
+            "nhead_q": 8,
+            "nhead_k": 2,
+            "has_logits_soft_cap": 1,
+            "bias_type": 1,
+            "has_lse": 1,
+            "has_dropout": 1,
+            "skip_min_seqlen_q": 1,
+            "qscale_type": 1,
+            "has_sink": 1,
+            "bench_variant": "skip",
+        }
+        self.assertEqual(sorted(alt), sorted(mha_gen_runtime_json.CONFLICT_COLS))
+        for col, value in alt.items():
+            with self.subTest(col=col), tempfile.TemporaryDirectory() as td:
+                a = _write_tuned(td, None, (1024,), gid=0)
+                b = _write_tuned(td, {col: value}, (4096,), gid=1)
+                msg = self._merge_error(a, b)
+                self.assertIn(f"differing in: {col})", msg)
+                self.assertIn(f"{col}={value} : {b.name}", msg)
+
+    def test_distinct_buckets_are_kept(self):
+        with tempfile.TemporaryDirectory() as td:
+            a = _write_tuned(td, {"mask_type": 0}, (1024,))
+            b = _write_tuned(
+                td,
+                {
+                    "mask_type": 2,
+                    "hdim_q": 256,
+                    "hdim_v": 256,
+                    "best_hdim_q": 256,
+                    "best_hdim_v": 256,
+                },
+                (4096,),
+            )
+            payload = _merge(a, b)
+        self.assertEqual(payload["dtypes"], ["bf16"])
+        self.assertEqual(sorted(payload["tiles"]["bf16"]), ["256,256", "80,96"])
+
+    def test_dtypes_are_sorted(self):
+        with tempfile.TemporaryDirectory() as td:
+            a = _write_tuned(td, {"dtype": "fp16"}, (1024,))
+            b = _write_tuned(td, {"dtype": "bf16"}, (4096,))
+            payload = _merge(a, b)
+            flipped = _merge(b, a)
+        self.assertEqual(payload["dtypes"], ["bf16", "fp16"])
+        self.assertEqual(payload["dtypes"], flipped["dtypes"])
+
+    def test_same_signature_two_ranges_merge(self):
+        with tempfile.TemporaryDirectory() as td:
+            a = _write_tuned(td, None, (256, 512), gid=0)
+            b = _write_tuned(td, None, (2048, 4096), tile=synth.ALT_TILE, gid=1)
+            payload = _merge(a, b)
+            flipped = _merge(b, a)
+        tiles = payload["tiles"]["bf16"]["80,96"]
+        self.assertEqual(
+            [t["_max_seqlen_samples"] for t in tiles], [[256, 512], [2048, 4096]]
+        )
+        self.assertEqual(
+            [t["cpp_constraint"] for t in tiles],
+            ["a.max_seqlen_q < 1280", "a.max_seqlen_q >= 1280"],
+        )
+        for p in (payload, flipped):
+            p["meta"].pop("generated_at")
+        self.assertEqual(payload, flipped)
+
+    def test_duplicate_max_seqlen_across_csvs(self):
+        with tempfile.TemporaryDirectory() as td:
+            a = _write_tuned(td, None, (256, 1024), gid=0)
+            b = _write_tuned(td, None, (1024,), tile=synth.ALT_TILE, gid=1)
+            names = ", ".join(sorted([a.name, b.name]))
+            msg = self._merge_error(a, b)
+        self.assertIn("same max_seqlen from several tuned csvs", msg)
+        self.assertIn(f"max_seqlen=1024 : {names}", msg)
+        self.assertIn("must be tuned together", msg)
+
+    def test_duplicate_max_seqlen_inside_one_csv(self):
+        with tempfile.TemporaryDirectory() as td:
+            a = _write_tuned(td, None, (256, 1024, 1024))
+            msg = self._merge_error(a)
+        self.assertIn("duplicate max_seqlen [1024]", msg)
+
+    def test_legacy_csv_without_signature_rejected(self):
+        for dropped in (
+            ["nhead_q", "nhead_k", "has_sink"],
+            ["bench_variant"],
+        ):
+            with self.subTest(dropped=dropped), tempfile.TemporaryDirectory() as td:
+                a = _write_tuned(td, None, (1024,), drop_columns=dropped)
+                msg = self._merge_error(a)
+                self.assertIn(f"missing required columns: {sorted(dropped)}", msg)
+                self.assertIn("mha_tune.py bench", msg)
+
+    def test_main_returns_2_and_writes_nothing(self):
+        with tempfile.TemporaryDirectory() as td:
+            a = _write_tuned(td, {"mask_type": 0}, (1024,))
+            b = _write_tuned(td, {"mask_type": 2}, (4096,))
+            out = Path(td) / "deploy.json"
+            argv = [
+                "mha_gen_runtime_json.py",
+                "--in",
+                str(a),
+                "--in",
+                str(b),
+                "--out",
+                str(out),
+            ]
+            err = io.StringIO()
+            with mock.patch.object(sys, "argv", argv), contextlib.redirect_stderr(err):
+                rc = mha_gen_runtime_json.main()
+            self.assertEqual(rc, 2)
+            self.assertFalse(out.exists())
+        self.assertIn("incompatible tuned csvs", err.getvalue())
+
+
 class TestSynthRoundTrip(unittest.TestCase):
     """The synthetic generators must stay parseable by the real tools."""
 
