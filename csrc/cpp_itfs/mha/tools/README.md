@@ -504,7 +504,9 @@ different tuned tiles at runtime.
 | CK-tile forward, **group (varlen)** mode      | **End-to-end validated.**           |
 | CK-tile forward, **batch** mode               | Dumped, **rejected by tooling**.    |
 | CK-tile forward, splitkv / appendkv / pagedkv | **Not dumped, not supported.**      |
-| CK-tile forward, `fmha_batch_prefill`         | **Not dumped, not supported.**      |
+| CK-tile forward, `fmha_batch_prefill` / `fmha_v3_varlen_fwd` | **Not dumped, not supported.** |
+| Sliding window / sink / soft-cap / qscale / dropout | **Dropped by `group`** and counted in `mha_dropped_summary.csv`. |
+| `min_seqlen_q != 0` (skip variant)            | Kept as a signature dimension; built and benched with the `nskip` variant (`[WARN]`) until the CK example runner can select skip. |
 | seqlen_q != seqlen_k (group mode)             | **Tuned by seqlen_q, with `[WARN]`;** full support pending. |
 | Backward pass                                 | **Not covered.**                    |
 
@@ -512,6 +514,22 @@ Anything outside the "validated" row above should be treated as
 best-effort: the tooling produces artifacts, but no perf/correctness
 regression has been signed off yet. Please share results (or issues)
 when you exercise those paths so the matrix can be updated.
+
+### Tests covering this pipeline
+
+| Test | Covers | Needs GPU |
+|------|--------|-----------|
+| `op_tests/tuning_tests/test_mha_fwd_tune_tools.py` (107 cases) | `mha_count_shape.py`, `mha_tune.py` and `mha_gen_runtime_json.py` end to end on synthetic dumps (`mha_fwd_tune_synth.py`): strict log parsing, group filtering, group signature / filename round-trip, benched-variant selection, verbatim bench args, build stamps, interval midpoints, merge conflict rejection, plus a full chain (dump → group → tune range → tuned CSV → merged JSON) over causal / GQA / `seqlen_q != seqlen_k` shapes | No |
+| `op_tests/test_mha_varlen_fwd_dump.py` | `AITER_DUMP_MHA_FWD_INFO` under `torch.cuda.graph` capture: eager vs captured/replayed records, one-time warning, sampling counter | Yes (skipped without a GPU) |
+
+```bash
+python3 -m unittest op_tests.tuning_tests.test_mha_fwd_tune_tools -v
+python3 -m pytest op_tests/test_mha_varlen_fwd_dump.py -v   # needs a GPU
+```
+
+The CPU suite runs in the level-0/1 job of
+`.github/workflows/tuning-tests.yaml` (scheduled, not on PRs), so quote
+its output in the PR description when the tooling changes.
 
 ---
 

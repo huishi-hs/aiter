@@ -1243,7 +1243,7 @@ def _stamp_path(build_dir: str | Path) -> Path:
 
 
 def _build_stamp(
-    plan: "TilePlan",
+    plan: TilePlan,
     extra_cmake_opts: Sequence[str],
     build_target: str,
 ) -> dict[str, Any]:

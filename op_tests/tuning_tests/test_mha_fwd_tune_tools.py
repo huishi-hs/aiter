@@ -1786,5 +1786,188 @@ class TestBuildStamp(unittest.TestCase):
         self.assertNotIn(str(plans[0].build_dir), err)
 
 
+def _gen_range(group_csv, range_spec, singletons=""):
+    args = argparse.Namespace(
+        input_csv=str(group_csv),
+        output="",
+        range=list(range_spec),
+        singletons=singletons,
+    )
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        mha_count_shape.cmd_generate_tune_range(args)
+    return buf.getvalue()
+
+
+def _fake_tuned(untune_path, work_dir, best_hdim=(80, 96), tiles=None, **row_over):
+    """Write the tuned CSV `bench` would produce for one untune CSV.
+
+    The signature columns are copied verbatim from the untune CSV (that is
+    what C6 makes `bench` do), so the merge stage sees the real signature.
+    """
+    meta, max_seqlens = mha_tune.parse_untune_csv(untune_path)
+    out = mha_tune.tuned_csv_path(meta, Path(work_dir))
+    tiles = list(tiles or [synth.DEFAULT_TILE])
+    synth.write_tuned_csv(
+        out,
+        {
+            **{c: getattr(meta, c) for c in mha_tune.SIGNATURE_COLS},
+            "bench_variant": mha_tune.bench_variant(meta),
+            "best_hdim_q": best_hdim[0],
+            "best_hdim_v": best_hdim[1],
+        },
+        [
+            {
+                "max_seqlen": m,
+                "tile": tiles[i % len(tiles)],
+                "best_tflops": 100.0 - i,
+            }
+            for i, m in enumerate(max_seqlens)
+        ],
+        **row_over,
+    )
+    return out, meta
+
+
+class TestEndToEnd(unittest.TestCase):
+    """C9: synthetic dump -> group -> tune range -> tuned CSV -> merged JSON.
+
+    Covers the three shapes the reviewers asked about (causal, GQA and
+    seqlen_q != seqlen_k) in one pass, without a GPU or a CK checkout.
+    """
+
+    # no-mask MHA at hdim 72 plus one prefix-cached call (sq != sk)
+    _LINES = (
+        [synth.make_dump_line(seqlens_q=[1024], hdim_q=72, hdim_v=72)] * 2
+        + [synth.make_dump_line(seqlens_q=[512])]
+        + [
+            synth.make_dump_line(
+                seqlens_q=[2048], seqlens_k=[4096]
+            )  # seqlen_q != seqlen_k
+        ]
+        # GQA causal at hdim 256 with min_seqlen_q != 0 (skip variant)
+        + [
+            synth.make_dump_line(
+                seqlens_q=[512],
+                hdim_q=256,
+                hdim_v=256,
+                nhead_k=2,
+                min_seqlen_q=1,
+                **_CAUSAL,
+            )
+        ]
+    )
+
+    def _run_pipeline(self, td):
+        out_dir, out = _run_cmd_group(td, self._LINES)
+        self.assertIn("kept 5 / dropped 0", out)
+        self.assertIn("seqlen_q != seqlen_k", out)
+
+        untunes = []
+        for gcsv in sorted(out_dir.glob("mha_group_*.csv")):
+            _gen_range(gcsv, ["256:1024:256"])
+            untunes.append(out_dir / gcsv.name.replace("mha_group_", "mha_untune_", 1))
+        self.assertEqual(len(untunes), 2)
+        return out_dir, untunes
+
+    def test_full_chain(self):
+        with tempfile.TemporaryDirectory() as td:
+            out_dir, untunes = self._run_pipeline(td)
+            summary = {
+                r["hdim_q"]: r
+                for r in _read_csv(out_dir / mha_count_shape.SUMMARY_NAME)
+            }
+
+            # 1) grouping: causal+GQA+skip and no-mask end up in separate groups
+            self.assertEqual(sorted(summary), ["256", "72"])
+            self.assertEqual(summary["256"]["mask_type"], "2")
+            self.assertEqual(summary["256"]["nhead_k"], "2")
+            self.assertEqual(summary["256"]["skip_min_seqlen_q"], "1")
+            self.assertEqual(
+                summary["72"]["signature"],
+                "group_bf16_hq72_hv72_mask0_nh16_nhk16_"
+                "nlogits_nbias_nlse_ndropout_nskip_nqscale_nsink",
+            )
+            # the prefix-cached call is kept and reported, not dropped
+            self.assertEqual(summary["72"]["seqlen_mismatch_calls"], "1")
+            self.assertEqual(summary["72"]["num_calls"], "4")
+
+            # 2) every untune CSV round-trips through the strict parser
+            metas = {}
+            for u in untunes:
+                meta, ms = mha_tune.parse_untune_csv(u)
+                self.assertEqual(ms, [256, 512, 768, 1024])
+                self.assertEqual(meta.mode, "group")
+                metas[meta.hdim_q] = meta
+            self.assertEqual(mha_tune.bench_variant(metas[256]), "nskip")
+            self.assertEqual(mha_tune._filters_from_meta(metas[256])["skip"], ["f"])
+
+            # 3) "bench" output -> merged JSON, one bucket per compiled hdim
+            tuned = {}
+            for u in untunes:
+                best = (80, 96) if "_hq72_" in u.name else (256, 256)
+                path, _ = _fake_tuned(
+                    u,
+                    out_dir / "work",
+                    best_hdim=best,
+                    tiles=[synth.DEFAULT_TILE, synth.ALT_TILE],
+                )
+                tuned[best] = path
+
+            payload = _merge(*tuned.values())
+
+        self.assertEqual(payload["dtypes"], ["bf16"])
+        self.assertEqual(sorted(payload["tiles"]["bf16"]), ["256,256", "80,96"])
+        # hq72 is compiled for (80,96): the raw 72 never becomes a bucket key
+        tiles = payload["tiles"]["bf16"]["80,96"]
+        self.assertEqual(
+            sorted(s for t in tiles for s in t["_max_seqlen_samples"]),
+            [256, 512, 768, 1024],
+        )
+        self.assertEqual(payload["meta"]["sources"][0]["orig_hdim_q"], 72)
+        self.assertEqual(payload["meta"]["sources"][0]["compiled_hdim_q"], 80)
+
+    def test_full_chain_is_order_independent(self):
+        with tempfile.TemporaryDirectory() as td:
+            out_dir, untunes = self._run_pipeline(td)
+            paths, metas = [], {}
+            for u in untunes:
+                best = (80, 96) if "_hq72_" in u.name else (256, 256)
+                path, meta = _fake_tuned(u, out_dir / "work", best_hdim=best)
+                paths.append(path)
+                metas[best] = meta
+            forward = _merge(*paths)
+            backward = _merge(*reversed(paths))
+        for p in (forward, backward):
+            p["meta"].pop("generated_at")
+        self.assertEqual(forward, backward)
+
+    def test_strict_rejects_seqlen_mismatch(self):
+        with tempfile.TemporaryDirectory() as td, self.assertRaises(SystemExit) as cm:
+            _run_cmd_group(td, self._LINES, strict=True)
+        self.assertEqual(cm.exception.code, 1)
+        self.assertIn("seqlen_q != seqlen_k", cm.exception.stdout)
+
+    def test_conflicting_group_is_rejected_end_to_end(self):
+        """Two vLLM layers, same raw hdim, different mask -> different buckets."""
+        lines = [
+            synth.make_dump_line(seqlens_q=[1024], hdim_q=72, hdim_v=72),
+            synth.make_dump_line(seqlens_q=[1024], hdim_q=72, hdim_v=72, **_CAUSAL),
+        ]
+        with tempfile.TemporaryDirectory() as td:
+            out_dir, _ = _run_cmd_group(td, lines)
+            paths = []
+            for gcsv in sorted(out_dir.glob("mha_group_*.csv")):
+                _gen_range(gcsv, ["512:1024:512"])
+                u = out_dir / gcsv.name.replace("mha_group_", "mha_untune_", 1)
+                paths.append(_fake_tuned(u, out_dir / "work")[0])
+            # both compile to (80,96) but differ in mask_type: refuse to merge
+            self.assertEqual(len({p.name for p in paths}), 2)
+            with self.assertRaises(ValueError) as cm:
+                _merge(*paths)
+        self.assertIn("differing in: mask_type", str(cm.exception))
+        self.assertIn("incompatible tuned csvs", str(cm.exception))
+
+
 if __name__ == "__main__":
     unittest.main()
